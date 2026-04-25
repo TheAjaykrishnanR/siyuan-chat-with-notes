@@ -1,0 +1,37 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --color-gray-50: #f9f9f9;
+  --color-gray-100: #f3f3f3;
+  --color-gray-200: #e5e5e5;
+  --color-gray-300: #d4d4d4;
+  --color-gray-400: #a3a3a3;
+  --color-gray-500: #737373;
+  --color-gray-600: #525252;
+  --color-gray-700: #404040;
+  --color-gray-800: #262626;
+  --color-gray-850: #1f1f1f;
+  --color-gray-900: #171717;
+  --color-gray-950: #0d0d0d;
+}
+
+body {
+  color: var(--color-gray-800);
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    color: var(--color-gray-100);
+  }
+}
+
+.chat-app, .chat-app * {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+button, .cursor-pointer, .cursor-pointer * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}

@@ -1,0 +1,19 @@
+{
+  "name": "siyuan-chat-with-notes",
+  "author": "Jayakuttan",
+  "version": "0.1.0",
+  "displayName": {
+    "default": "Chat with Notes",
+    "zh_CN": "随笔连聊",
+    "en_US": "Chat with Notes"
+  },
+  "description": {
+    "default": "Chat with AI while referencing your SiYuan notes.",
+    "zh_CN": "在聊天中引用思源笔记与 AI 对话。",
+    "en_US": "Chat with AI while referencing your SiYuan notes."
+  },
+  "icon": "icon.svg",
+  "minAppVersion": "2.10.0",
+  "frontEnd": true,
+  "backends": ["windows", "linux", "darwin", "docker"]
+}

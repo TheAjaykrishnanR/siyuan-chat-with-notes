@@ -1,0 +1,12 @@
+{
+  "chatWithNotes": "随笔连聊",
+  "settings": "设置",
+  "apiKey": "API 密钥",
+  "apiModel": "API 模型",
+  "apiProvider": "API 提供商",
+  "save": "保存",
+  "cancel": "取消",
+  "newChat": "新对话",
+  "history": "历史记录",
+  "placeholder": "输入 @ 以引用笔记..."
+}

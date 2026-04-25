@@ -1,0 +1,12 @@
+{
+  "chatWithNotes": "Chat with Notes",
+  "settings": "Settings",
+  "apiKey": "API Key",
+  "apiModel": "API Model",
+  "apiProvider": "API Provider",
+  "save": "Save",
+  "cancel": "Cancel",
+  "newChat": "New Chat",
+  "history": "History",
+  "placeholder": "Type @ to reference notes..."
+}
