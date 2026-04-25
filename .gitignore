@@ -8,6 +8,7 @@ package.zip
 .idea/
 index.js.map
 open-webui
+siyuan-plugin-api-reference
 # If you decide to move build output to a subfolder later:
 #/index.js
 #/index.css
