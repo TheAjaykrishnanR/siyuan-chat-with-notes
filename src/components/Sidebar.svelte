@@ -2,7 +2,7 @@
     import { createEventDispatcher, onMount } from 'svelte';
     import { conversations, currentConversationId, createNewConversation, deleteConversation } from '../store/chat';
     import type { IConversation } from '../store/chat';
-    import { Plus, Search, MessageSquare, MoreHorizontal, Trash2, Settings, FileDown, Download } from 'lucide-svelte';
+    import { Plus, Search, MessageSquare, MoreHorizontal, Trash2, Settings, FileDown, Download, X } from 'lucide-svelte';
     import { createDoc, getNotebooks } from '../api/siyuan';
     import { showMessage } from 'siyuan';
 
@@ -89,76 +89,70 @@
     });
 </script>
 
-<div class="w-[260px] h-full flex flex-col bg-gray-50 dark:bg-gray-950 transition-all duration-300 z-10 border-r border-gray-200 dark:border-gray-800">
-    <div class="px-[9px] pt-2 pb-1.5 flex justify-between space-x-1 text-gray-600 dark:text-gray-400 sticky top-0 z-1 -mb-3">
-        <a class="flex items-center rounded-xl w-[34px] h-[34px] justify-center hover:bg-gray-100/50 dark:hover:bg-gray-850/50 transition cursor-pointer" on:click={() => { createNewConversation(); dispatch('close'); }}>
-            <div class="w-6 h-6 rounded-full bg-black dark:bg-white flex items-center justify-center">
-                 <div class="w-3 h-3 bg-white dark:bg-black rounded-sm"></div>
+<div class="w-[280px] h-full flex flex-col glass-effect-strong transition-all duration-500 z-50 border-r border-white/10">
+    <div class="px-4 pt-4 pb-2 flex justify-between items-center text-gray-600 dark:text-gray-400">
+        <button class="flex items-center gap-2 group cursor-pointer" on:click={() => { createNewConversation(); dispatch('close'); }}>
+            <div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 flex items-center justify-center shadow-lg group-hover:rotate-12 transition-all duration-300">
+                 <div class="w-3 h-3 bg-white rounded-full animate-pulse"></div>
             </div>
-        </a>
-        <a class="flex flex-1 px-0.5 cursor-pointer" on:click={() => { createNewConversation(); dispatch('close'); }}>      
-            <div class="self-center font-medium text-gray-850 dark:text-white font-primary">
-                Chat
-            </div>
-        </a>
-        <div class="flex items-center space-x-1">
-             <button class="p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition cursor-pointer" on:click={() => { createNewConversation(); dispatch('close'); }}>
-                <Plus size={18} />
-            </button>
-        </div>
+            <span class="font-bold text-gray-900 dark:text-white tracking-tight">Gemini Chat</span>
+        </button>
+        <button class="w-9 h-9 flex items-center justify-center rounded-full hover:bg-blue-500/10 dark:hover:bg-blue-400/10 transition-all cursor-pointer hover:scale-110 active:scale-95 border border-transparent hover:border-blue-500/20" on:click={() => { createNewConversation(); dispatch('close'); }}>
+            <Plus size={20} class="text-blue-500" />
+        </button>
     </div>
 
-    <div class="px-3 pt-6 pb-2">
-        <div class="relative flex items-center">
-            <Search size={14} class="absolute left-3 text-gray-400" />
+    <div class="px-4 py-4">
+        <div class="relative flex items-center group">
+            <Search size={14} class="absolute left-3 text-gray-400 group-focus-within:text-blue-500 transition-colors" />
             <input 
                 type="text" 
                 bind:value={searchQuery}
-                placeholder="Search chats..."
-                class="w-full pl-9 pr-3 py-2 bg-gray-100 dark:bg-gray-900 border-none rounded-xl text-sm outline-none focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 transition-all"
+                placeholder="Search conversations..."
+                class="w-full pl-10 pr-4 py-2.5 bg-gray-500/5 dark:bg-white/5 border border-transparent focus:border-blue-500/30 rounded-2xl text-sm outline-none transition-all placeholder:text-gray-500"
             />
         </div>
     </div>
 
-    <div class="flex-1 overflow-y-auto px-2 py-2 space-y-0.5">
+    <div class="flex-1 overflow-y-auto px-3 py-2 space-y-1 custom-scrollbar">
         {#each filteredConversations as conv}
             <div class="group relative">
                 <button 
-                    class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left transition-all cursor-pointer {conv.id === $currentConversationId ? 'bg-white dark:bg-gray-850 shadow-sm text-black dark:text-white' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-900'}"
+                    class="w-full flex items-center gap-3 px-3 py-3 rounded-2xl text-left transition-all cursor-pointer {conv.id === $currentConversationId ? 'bg-blue-500/10 text-blue-600 dark:text-blue-300 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800/50'}"
                     on:click={() => selectConversation(conv.id)}
                 >
-                    <MessageSquare size={16} class="shrink-0" />
+                    <MessageSquare size={16} class="shrink-0 {conv.id === $currentConversationId ? 'text-blue-500' : 'text-blue-500/70'}" />
                     <div class="flex-1 truncate text-[13px] font-medium">{conv.title}</div>
                     
                     <button 
-                        class="absolute right-2 top-1.5 p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-800 opacity-0 group-hover:opacity-100 transition-all cursor-pointer z-1"
+                        class="p-1.5 rounded-lg text-current opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-gray-700 transition-all cursor-pointer"
                         on:click|stopPropagation={(e) => toggleMenu(e, conv.id)}
                     >
                         <MoreHorizontal size={14} />
                     </button>
 
                     {#if openMenuId === conv.id}
-                        <div class="absolute right-2 top-10 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-xl py-1.5 z-10 min-w-[160px] overflow-hidden animate-in fade-in zoom-in duration-100">
+                        <div class="absolute right-0 top-12 glass-effect-strong rounded-2xl p-1.5 z-50 min-w-[180px] animate-in fade-in zoom-in-95 duration-150">
                             <button 
-                                class="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2.5 transition-colors cursor-pointer"
+                                class="w-full px-4 py-2.5 rounded-xl text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-3 transition-colors cursor-pointer"
                                 on:click|stopPropagation={() => handleExportSiYuan(conv)}
                             >
-                                <FileDown size={14} />
+                                <FileDown size={16} class="text-blue-500" />
                                 <span>Save to SiYuan</span>
                             </button>
                             <button 
-                                class="w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2.5 transition-colors cursor-pointer"
+                                class="w-full px-4 py-2.5 rounded-xl text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-3 transition-colors cursor-pointer"
                                 on:click|stopPropagation={() => handleExportMarkdown(conv)}
                             >
-                                <Download size={14} />
+                                <Download size={16} class="text-green-500" />
                                 <span>Export .md</span>
                             </button>
-                            <div class="h-px bg-gray-100 dark:bg-gray-700 my-1"></div>
+                            <div class="h-px bg-gray-100 dark:bg-gray-800 my-1 mx-2"></div>
                             <button 
-                                class="w-full px-4 py-2 text-left text-sm text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 flex items-center gap-2.5 transition-colors cursor-pointer"
+                                class="w-full px-4 py-2.5 rounded-xl text-left text-sm hover:bg-red-500/10 flex items-center gap-3 transition-colors cursor-pointer text-red-500"
                                 on:click|stopPropagation={() => handleDelete(conv.id)}
                             >
-                                <Trash2 size={14} />
+                                <Trash2 size={16} />
                                 <span>Delete Chat</span>
                             </button>
                         </div>
@@ -168,12 +162,12 @@
         {/each}
     </div>
 
-    <div class="p-2 mt-auto border-t border-gray-200 dark:border-gray-800">
+    <div class="p-4 mt-auto border-t border-white/10">
         <button 
-            class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-900 transition-all text-sm font-medium text-gray-700 dark:text-gray-300 cursor-pointer"
+            class="w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-gray-600 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-gray-800/50 transition-all text-sm font-semibold cursor-pointer group"
             on:click={() => dispatch('openSettings')}
         >
-            <Settings size={16} />
+            <Settings size={18} class="group-hover:rotate-90 transition-transform duration-500" />
             <span>{i18n.settings}</span>
         </button>
     </div>

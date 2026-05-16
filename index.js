@@ -12,6 +12,7 @@ var _Marked_instances, parseMarkdown_fn, onError_fn;
 const siyuan = require("siyuan");
 function noop() {
 }
+const identity = (x) => x;
 function assign(tar, src) {
   for (const k in src) tar[k] = src[k];
   return (
@@ -105,8 +106,67 @@ function compute_rest_props(props, keys) {
   for (const k in props) if (!keys.has(k) && k[0] !== "$") rest[k] = props[k];
   return rest;
 }
+function split_css_unit(value) {
+  const split = typeof value === "string" && value.match(/^\s*(-?[\d.]+)([^\s]*)\s*$/);
+  return split ? [parseFloat(split[1]), split[2] || "px"] : [
+    /** @type {number} */
+    value,
+    "px"
+  ];
+}
+const is_client = typeof window !== "undefined";
+let now = is_client ? () => window.performance.now() : () => Date.now();
+let raf = is_client ? (cb) => requestAnimationFrame(cb) : noop;
+const tasks = /* @__PURE__ */ new Set();
+function run_tasks(now2) {
+  tasks.forEach((task) => {
+    if (!task.c(now2)) {
+      tasks.delete(task);
+      task.f();
+    }
+  });
+  if (tasks.size !== 0) raf(run_tasks);
+}
+function loop(callback) {
+  let task;
+  if (tasks.size === 0) raf(run_tasks);
+  return {
+    promise: new Promise((fulfill) => {
+      tasks.add(task = { c: callback, f: fulfill });
+    }),
+    abort() {
+      tasks.delete(task);
+    }
+  };
+}
 function append(target, node) {
   target.appendChild(node);
+}
+function get_root_for_style(node) {
+  if (!node) return document;
+  const root = node.getRootNode ? node.getRootNode() : node.ownerDocument;
+  if (root && /** @type {ShadowRoot} */
+  root.host) {
+    return (
+      /** @type {ShadowRoot} */
+      root
+    );
+  }
+  return node.ownerDocument;
+}
+function append_empty_stylesheet(node) {
+  const style_element = element("style");
+  style_element.textContent = "/* empty */";
+  append_stylesheet(get_root_for_style(node), style_element);
+  return style_element.sheet;
+}
+function append_stylesheet(node, style) {
+  append(
+    /** @type {Document} */
+    node.head || node,
+    style
+  );
+  return style.sheet;
 }
 function insert(target, node, anchor) {
   target.insertBefore(node, anchor || null);
@@ -266,6 +326,64 @@ class HtmlTag {
     this.n.forEach(detach);
   }
 }
+const managed_styles = /* @__PURE__ */ new Map();
+let active = 0;
+function hash(str) {
+  let hash2 = 5381;
+  let i = str.length;
+  while (i--) hash2 = (hash2 << 5) - hash2 ^ str.charCodeAt(i);
+  return hash2 >>> 0;
+}
+function create_style_information(doc, node) {
+  const info = { stylesheet: append_empty_stylesheet(node), rules: {} };
+  managed_styles.set(doc, info);
+  return info;
+}
+function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
+  const step = 16.666 / duration;
+  let keyframes = "{\n";
+  for (let p = 0; p <= 1; p += step) {
+    const t = a + (b - a) * ease(p);
+    keyframes += p * 100 + `%{${fn(t, 1 - t)}}
+`;
+  }
+  const rule = keyframes + `100% {${fn(b, 1 - b)}}
+}`;
+  const name = `__svelte_${hash(rule)}_${uid}`;
+  const doc = get_root_for_style(node);
+  const { stylesheet, rules } = managed_styles.get(doc) || create_style_information(doc, node);
+  if (!rules[name]) {
+    rules[name] = true;
+    stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
+  }
+  const animation = node.style.animation || "";
+  node.style.animation = `${animation ? `${animation}, ` : ""}${name} ${duration}ms linear ${delay}ms 1 both`;
+  active += 1;
+  return name;
+}
+function delete_rule(node, name) {
+  const previous = (node.style.animation || "").split(", ");
+  const next = previous.filter(
+    name ? (anim) => anim.indexOf(name) < 0 : (anim) => anim.indexOf("__svelte") === -1
+    // remove all Svelte animations
+  );
+  const deleted = previous.length - next.length;
+  if (deleted) {
+    node.style.animation = next.join(", ");
+    active -= deleted;
+    if (!active) clear_rules();
+  }
+}
+function clear_rules() {
+  raf(() => {
+    if (active) return;
+    managed_styles.forEach((info) => {
+      const { ownerNode } = info.stylesheet;
+      if (ownerNode) detach(ownerNode);
+    });
+    managed_styles.clear();
+  });
+}
 let current_component;
 function set_current_component(component) {
   current_component = component;
@@ -377,6 +495,19 @@ function flush_render_callbacks(fns) {
   targets.forEach((c) => c());
   render_callbacks = filtered;
 }
+let promise;
+function wait() {
+  if (!promise) {
+    promise = Promise.resolve();
+    promise.then(() => {
+      promise = null;
+    });
+  }
+  return promise;
+}
+function dispatch(node, direction, kind) {
+  node.dispatchEvent(custom_event(`${direction ? "intro" : "outro"}${kind}`));
+}
 const outroing = /* @__PURE__ */ new Set();
 let outros;
 function group_outros() {
@@ -414,6 +545,129 @@ function transition_out(block2, local, detach2, callback) {
   } else if (callback) {
     callback();
   }
+}
+const null_transition = { duration: 0 };
+function create_bidirectional_transition(node, fn, params, intro) {
+  const options = { direction: "both" };
+  let config = fn(node, params, options);
+  let t = intro ? 0 : 1;
+  let running_program = null;
+  let pending_program = null;
+  let animation_name = null;
+  let original_inert_value;
+  function clear_animation() {
+    if (animation_name) delete_rule(node, animation_name);
+  }
+  function init2(program, duration) {
+    const d = (
+      /** @type {Program['d']} */
+      program.b - t
+    );
+    duration *= Math.abs(d);
+    return {
+      a: t,
+      b: program.b,
+      d,
+      duration,
+      start: program.start,
+      end: program.start + duration,
+      group: program.group
+    };
+  }
+  function go(b) {
+    const {
+      delay = 0,
+      duration = 300,
+      easing = identity,
+      tick = noop,
+      css
+    } = config || null_transition;
+    const program = {
+      start: now() + delay,
+      b
+    };
+    if (!b) {
+      program.group = outros;
+      outros.r += 1;
+    }
+    if ("inert" in node) {
+      if (b) {
+        if (original_inert_value !== void 0) {
+          node.inert = original_inert_value;
+        }
+      } else {
+        original_inert_value = /** @type {HTMLElement} */
+        node.inert;
+        node.inert = true;
+      }
+    }
+    if (running_program || pending_program) {
+      pending_program = program;
+    } else {
+      if (css) {
+        clear_animation();
+        animation_name = create_rule(node, t, b, duration, delay, easing, css);
+      }
+      if (b) tick(0, 1);
+      running_program = init2(program, duration);
+      add_render_callback(() => dispatch(node, b, "start"));
+      loop((now2) => {
+        if (pending_program && now2 > pending_program.start) {
+          running_program = init2(pending_program, duration);
+          pending_program = null;
+          dispatch(node, running_program.b, "start");
+          if (css) {
+            clear_animation();
+            animation_name = create_rule(
+              node,
+              t,
+              running_program.b,
+              running_program.duration,
+              0,
+              easing,
+              config.css
+            );
+          }
+        }
+        if (running_program) {
+          if (now2 >= running_program.end) {
+            tick(t = running_program.b, 1 - t);
+            dispatch(node, running_program.b, "end");
+            if (!pending_program) {
+              if (running_program.b) {
+                clear_animation();
+              } else {
+                if (!--running_program.group.r) run_all(running_program.group.c);
+              }
+            }
+            running_program = null;
+          } else if (now2 >= running_program.start) {
+            const p = now2 - running_program.start;
+            t = running_program.a + running_program.d * easing(p / running_program.duration);
+            tick(t, 1 - t);
+          }
+        }
+        return !!(running_program || pending_program);
+      });
+    }
+  }
+  return {
+    run(b) {
+      if (is_function(config)) {
+        wait().then(() => {
+          const opts = { direction: b ? "in" : "out" };
+          config = config(opts);
+          go(b);
+        });
+      } else {
+        go(b);
+      }
+    },
+    end() {
+      clear_animation();
+      running_program = pending_program = null;
+    }
+  };
 }
 function ensure_array_like(array_like_or_iterator) {
   return (array_like_or_iterator == null ? void 0 : array_like_or_iterator.length) !== void 0 ? array_like_or_iterator : Array.from(array_like_or_iterator);
@@ -594,6 +848,35 @@ class SvelteComponent {
 const PUBLIC_VERSION = "4";
 if (typeof window !== "undefined")
   (window.__svelte || (window.__svelte = { v: /* @__PURE__ */ new Set() })).v.add(PUBLIC_VERSION);
+function cubicOut(t) {
+  const f = t - 1;
+  return f * f * f + 1;
+}
+function fade(node, { delay = 0, duration = 400, easing = identity } = {}) {
+  const o = +getComputedStyle(node).opacity;
+  return {
+    delay,
+    duration,
+    easing,
+    css: (t) => `opacity: ${t * o}`
+  };
+}
+function fly(node, { delay = 0, duration = 400, easing = cubicOut, x = 0, y = 0, opacity = 0 } = {}) {
+  const style = getComputedStyle(node);
+  const target_opacity = +style.opacity;
+  const transform = style.transform === "none" ? "" : style.transform;
+  const od = target_opacity * (1 - opacity);
+  const [xValue, xUnit] = split_css_unit(x);
+  const [yValue, yUnit] = split_css_unit(y);
+  return {
+    delay,
+    duration,
+    easing,
+    css: (t, u) => `
+			transform: ${transform} translate(${(1 - t) * xValue}${xUnit}, ${(1 - t) * yValue}${yUnit});
+			opacity: ${target_opacity - od * u}`
+  };
+}
 const subscriber_queue = [];
 function writable(value, start = noop) {
   let stop;
@@ -2485,7 +2768,7 @@ function create_fragment$i(ctx) {
   let icon;
   let current;
   const icon_spread_levels = [
-    { name: "message-square" },
+    { name: "menu" },
     /*$$props*/
     ctx[1],
     { iconNode: (
@@ -2548,9 +2831,30 @@ function instance$i($$self, $$props, $$invalidate) {
   let { $$slots: slots = {}, $$scope } = $$props;
   const iconNode = [
     [
-      "path",
+      "line",
       {
-        "d": "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"
+        "x1": "4",
+        "x2": "20",
+        "y1": "12",
+        "y2": "12"
+      }
+    ],
+    [
+      "line",
+      {
+        "x1": "4",
+        "x2": "20",
+        "y1": "6",
+        "y2": "6"
+      }
+    ],
+    [
+      "line",
+      {
+        "x1": "4",
+        "x2": "20",
+        "y1": "18",
+        "y2": "18"
       }
     ]
   ];
@@ -2561,7 +2865,7 @@ function instance$i($$self, $$props, $$invalidate) {
   $$props = exclude_internal_props($$props);
   return [iconNode, $$props, slots, $$scope];
 }
-class Message_square extends SvelteComponent {
+class Menu extends SvelteComponent {
   constructor(options) {
     super();
     init(this, options, instance$i, create_fragment$i, safe_not_equal, {});
@@ -2633,7 +2937,7 @@ function create_fragment$h(ctx) {
   let icon;
   let current;
   const icon_spread_levels = [
-    { name: "more-horizontal" },
+    { name: "message-square" },
     /*$$props*/
     ctx[1],
     { iconNode: (
@@ -2695,9 +2999,12 @@ function create_fragment$h(ctx) {
 function instance$h($$self, $$props, $$invalidate) {
   let { $$slots: slots = {}, $$scope } = $$props;
   const iconNode = [
-    ["circle", { "cx": "12", "cy": "12", "r": "1" }],
-    ["circle", { "cx": "19", "cy": "12", "r": "1" }],
-    ["circle", { "cx": "5", "cy": "12", "r": "1" }]
+    [
+      "path",
+      {
+        "d": "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"
+      }
+    ]
   ];
   $$self.$$set = ($$new_props) => {
     $$invalidate(1, $$props = assign(assign({}, $$props), exclude_internal_props($$new_props)));
@@ -2706,7 +3013,7 @@ function instance$h($$self, $$props, $$invalidate) {
   $$props = exclude_internal_props($$props);
   return [iconNode, $$props, slots, $$scope];
 }
-class More_horizontal extends SvelteComponent {
+class Message_square extends SvelteComponent {
   constructor(options) {
     super();
     init(this, options, instance$h, create_fragment$h, safe_not_equal, {});
@@ -2778,7 +3085,7 @@ function create_fragment$g(ctx) {
   let icon;
   let current;
   const icon_spread_levels = [
-    { name: "panel-left-open" },
+    { name: "more-horizontal" },
     /*$$props*/
     ctx[1],
     { iconNode: (
@@ -2840,19 +3147,9 @@ function create_fragment$g(ctx) {
 function instance$g($$self, $$props, $$invalidate) {
   let { $$slots: slots = {}, $$scope } = $$props;
   const iconNode = [
-    [
-      "rect",
-      {
-        "width": "18",
-        "height": "18",
-        "x": "3",
-        "y": "3",
-        "rx": "2",
-        "ry": "2"
-      }
-    ],
-    ["path", { "d": "M9 3v18" }],
-    ["path", { "d": "m14 9 3 3-3 3" }]
+    ["circle", { "cx": "12", "cy": "12", "r": "1" }],
+    ["circle", { "cx": "19", "cy": "12", "r": "1" }],
+    ["circle", { "cx": "5", "cy": "12", "r": "1" }]
   ];
   $$self.$$set = ($$new_props) => {
     $$invalidate(1, $$props = assign(assign({}, $$props), exclude_internal_props($$new_props)));
@@ -2861,7 +3158,7 @@ function instance$g($$self, $$props, $$invalidate) {
   $$props = exclude_internal_props($$props);
   return [iconNode, $$props, slots, $$scope];
 }
-class Panel_left_open extends SvelteComponent {
+class More_horizontal extends SvelteComponent {
   constructor(options) {
     super();
     init(this, options, instance$g, create_fragment$g, safe_not_equal, {});
@@ -4364,7 +4661,7 @@ class X extends SvelteComponent {
 }
 function get_each_context$4(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[23] = list2[i];
+  child_ctx[22] = list2[i];
   return child_ctx;
 }
 function create_if_block$5(ctx) {
@@ -4388,33 +4685,37 @@ function create_if_block$5(ctx) {
   let current;
   let mounted;
   let dispose;
-  filedown = new File_down({ props: { size: 14 } });
+  filedown = new File_down({
+    props: { size: 16, class: "text-blue-500" }
+  });
+  function click_handler_3() {
+    return (
+      /*click_handler_3*/
+      ctx[17](
+        /*conv*/
+        ctx[22]
+      )
+    );
+  }
+  download = new Download({
+    props: { size: 16, class: "text-green-500" }
+  });
   function click_handler_4() {
     return (
       /*click_handler_4*/
       ctx[18](
         /*conv*/
-        ctx[23]
+        ctx[22]
       )
     );
   }
-  download = new Download({ props: { size: 14 } });
+  trash2 = new Trash_2({ props: { size: 16 } });
   function click_handler_5() {
     return (
       /*click_handler_5*/
       ctx[19](
         /*conv*/
-        ctx[23]
-      )
-    );
-  }
-  trash2 = new Trash_2({ props: { size: 14 } });
-  function click_handler_6() {
-    return (
-      /*click_handler_6*/
-      ctx[20](
-        /*conv*/
-        ctx[23]
+        ctx[22]
       )
     );
   }
@@ -4440,11 +4741,11 @@ function create_if_block$5(ctx) {
       t7 = space();
       span2 = element("span");
       span2.textContent = "Delete Chat";
-      attr(button0, "class", "w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2.5 transition-colors cursor-pointer");
-      attr(button1, "class", "w-full px-4 py-2 text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2.5 transition-colors cursor-pointer");
-      attr(div0, "class", "h-px bg-gray-100 dark:bg-gray-700 my-1");
-      attr(button2, "class", "w-full px-4 py-2 text-left text-sm text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 flex items-center gap-2.5 transition-colors cursor-pointer");
-      attr(div1, "class", "absolute right-2 top-10 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-xl py-1.5 z-10 min-w-[160px] overflow-hidden animate-in fade-in zoom-in duration-100");
+      attr(button0, "class", "w-full px-4 py-2.5 rounded-xl text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-3 transition-colors cursor-pointer");
+      attr(button1, "class", "w-full px-4 py-2.5 rounded-xl text-left text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-3 transition-colors cursor-pointer");
+      attr(div0, "class", "h-px bg-gray-100 dark:bg-gray-800 my-1 mx-2");
+      attr(button2, "class", "w-full px-4 py-2.5 rounded-xl text-left text-sm hover:bg-red-500/10 flex items-center gap-3 transition-colors cursor-pointer text-red-500");
+      attr(div1, "class", "absolute right-0 top-12 glass-effect-strong rounded-2xl p-1.5 z-50 min-w-[180px] animate-in fade-in zoom-in-95 duration-150");
     },
     m(target, anchor) {
       insert(target, div1, anchor);
@@ -4467,9 +4768,9 @@ function create_if_block$5(ctx) {
       current = true;
       if (!mounted) {
         dispose = [
-          listen(button0, "click", stop_propagation(click_handler_4)),
-          listen(button1, "click", stop_propagation(click_handler_5)),
-          listen(button2, "click", stop_propagation(click_handler_6))
+          listen(button0, "click", stop_propagation(click_handler_3)),
+          listen(button1, "click", stop_propagation(click_handler_4)),
+          listen(button2, "click", stop_propagation(click_handler_5))
         ];
         mounted = true;
       }
@@ -4510,7 +4811,7 @@ function create_each_block$4(ctx) {
   let div0;
   let t1_value = (
     /*conv*/
-    ctx[23].title + ""
+    ctx[22].title + ""
   );
   let t1;
   let t2;
@@ -4522,14 +4823,21 @@ function create_each_block$4(ctx) {
   let current;
   let mounted;
   let dispose;
-  messagesquare = new Message_square({ props: { size: 16, class: "shrink-0" } });
+  messagesquare = new Message_square({
+    props: {
+      size: 16,
+      class: "shrink-0 " + /*conv*/
+      (ctx[22].id === /*$currentConversationId*/
+      ctx[4] ? "text-blue-500" : "text-blue-500/70")
+    }
+  });
   morehorizontal = new More_horizontal({ props: { size: 14 } });
-  function click_handler_3(...args) {
+  function click_handler_2(...args) {
     return (
-      /*click_handler_3*/
-      ctx[17](
+      /*click_handler_2*/
+      ctx[16](
         /*conv*/
-        ctx[23],
+        ctx[22],
         ...args
       )
     );
@@ -4537,14 +4845,14 @@ function create_each_block$4(ctx) {
   let if_block = (
     /*openMenuId*/
     ctx[2] === /*conv*/
-    ctx[23].id && create_if_block$5(ctx)
+    ctx[22].id && create_if_block$5(ctx)
   );
-  function click_handler_7() {
+  function click_handler_6() {
     return (
-      /*click_handler_7*/
-      ctx[21](
+      /*click_handler_6*/
+      ctx[20](
         /*conv*/
-        ctx[23]
+        ctx[22]
       )
     );
   }
@@ -4563,10 +4871,10 @@ function create_each_block$4(ctx) {
       if (if_block) if_block.c();
       t4 = space();
       attr(div0, "class", "flex-1 truncate text-[13px] font-medium");
-      attr(button0, "class", "absolute right-2 top-1.5 p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-800 opacity-0 group-hover:opacity-100 transition-all cursor-pointer z-1");
-      attr(button1, "class", button1_class_value = "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left transition-all cursor-pointer " + /*conv*/
-      (ctx[23].id === /*$currentConversationId*/
-      ctx[4] ? "bg-white dark:bg-gray-850 shadow-sm text-black dark:text-white" : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-900"));
+      attr(button0, "class", "p-1.5 rounded-lg text-current opacity-0 group-hover:opacity-100 hover:bg-gray-200 dark:hover:bg-gray-700 transition-all cursor-pointer");
+      attr(button1, "class", button1_class_value = "w-full flex items-center gap-3 px-3 py-3 rounded-2xl text-left transition-all cursor-pointer " + /*conv*/
+      (ctx[22].id === /*$currentConversationId*/
+      ctx[4] ? "bg-blue-500/10 text-blue-600 dark:text-blue-300 font-medium" : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800/50"));
       attr(div1, "class", "group relative");
     },
     m(target, anchor) {
@@ -4585,21 +4893,27 @@ function create_each_block$4(ctx) {
       current = true;
       if (!mounted) {
         dispose = [
-          listen(button0, "click", stop_propagation(click_handler_3)),
-          listen(button1, "click", click_handler_7)
+          listen(button0, "click", stop_propagation(click_handler_2)),
+          listen(button1, "click", click_handler_6)
         ];
         mounted = true;
       }
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
+      const messagesquare_changes = {};
+      if (dirty & /*filteredConversations, $currentConversationId*/
+      24) messagesquare_changes.class = "shrink-0 " + /*conv*/
+      (ctx[22].id === /*$currentConversationId*/
+      ctx[4] ? "text-blue-500" : "text-blue-500/70");
+      messagesquare.$set(messagesquare_changes);
       if ((!current || dirty & /*filteredConversations*/
       8) && t1_value !== (t1_value = /*conv*/
-      ctx[23].title + "")) set_data(t1, t1_value);
+      ctx[22].title + "")) set_data(t1, t1_value);
       if (
         /*openMenuId*/
         ctx[2] === /*conv*/
-        ctx[23].id
+        ctx[22].id
       ) {
         if (if_block) {
           if_block.p(ctx, dirty);
@@ -4621,9 +4935,9 @@ function create_each_block$4(ctx) {
         check_outros();
       }
       if (!current || dirty & /*filteredConversations, $currentConversationId*/
-      24 && button1_class_value !== (button1_class_value = "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left transition-all cursor-pointer " + /*conv*/
-      (ctx[23].id === /*$currentConversationId*/
-      ctx[4] ? "bg-white dark:bg-gray-850 shadow-sm text-black dark:text-white" : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-900"))) {
+      24 && button1_class_value !== (button1_class_value = "w-full flex items-center gap-3 px-3 py-3 rounded-2xl text-left transition-all cursor-pointer " + /*conv*/
+      (ctx[22].id === /*$currentConversationId*/
+      ctx[4] ? "bg-blue-500/10 text-blue-600 dark:text-blue-300 font-medium" : "text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800/50"))) {
         attr(button1, "class", button1_class_value);
       }
     },
@@ -4653,29 +4967,26 @@ function create_each_block$4(ctx) {
   };
 }
 function create_fragment$5(ctx) {
-  let div9;
-  let div4;
-  let a0;
-  let t0;
-  let a1;
-  let t2;
-  let div3;
+  let div7;
+  let div2;
   let button0;
+  let t2;
+  let button1;
   let plus;
   let t3;
-  let div6;
-  let div5;
+  let div4;
+  let div3;
   let search;
   let t4;
   let input;
   let t5;
-  let div7;
+  let div5;
   let t6;
-  let div8;
-  let button1;
+  let div6;
+  let button2;
   let settings;
   let t7;
-  let span;
+  let span1;
   let t8_value = (
     /*i18n*/
     ctx[0].settings + ""
@@ -4684,11 +4995,13 @@ function create_fragment$5(ctx) {
   let current;
   let mounted;
   let dispose;
-  plus = new Plus({ props: { size: 18 } });
+  plus = new Plus({
+    props: { size: 20, class: "text-blue-500" }
+  });
   search = new Search({
     props: {
       size: 14,
-      class: "absolute left-3 text-gray-400"
+      class: "absolute left-3 text-gray-400 group-focus-within:text-blue-500 transition-colors"
     }
   });
   let each_value = ensure_array_like(
@@ -4702,120 +5015,110 @@ function create_fragment$5(ctx) {
   const out = (i) => transition_out(each_blocks[i], 1, 1, () => {
     each_blocks[i] = null;
   });
-  settings = new Settings$1({ props: { size: 16 } });
+  settings = new Settings$1({
+    props: {
+      size: 18,
+      class: "group-hover:rotate-90 transition-transform duration-500"
+    }
+  });
   return {
     c() {
-      div9 = element("div");
-      div4 = element("div");
-      a0 = element("a");
-      a0.innerHTML = `<div class="w-6 h-6 rounded-full bg-black dark:bg-white flex items-center justify-center"><div class="w-3 h-3 bg-white dark:bg-black rounded-sm"></div></div>`;
-      t0 = space();
-      a1 = element("a");
-      a1.innerHTML = `<div class="self-center font-medium text-gray-850 dark:text-white font-primary">Chat</div>`;
-      t2 = space();
-      div3 = element("div");
+      div7 = element("div");
+      div2 = element("div");
       button0 = element("button");
+      button0.innerHTML = `<div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 flex items-center justify-center shadow-lg group-hover:rotate-12 transition-all duration-300"><div class="w-3 h-3 bg-white rounded-full animate-pulse"></div></div> <span class="font-bold text-gray-900 dark:text-white tracking-tight">Gemini Chat</span>`;
+      t2 = space();
+      button1 = element("button");
       create_component(plus.$$.fragment);
       t3 = space();
-      div6 = element("div");
-      div5 = element("div");
+      div4 = element("div");
+      div3 = element("div");
       create_component(search.$$.fragment);
       t4 = space();
       input = element("input");
       t5 = space();
-      div7 = element("div");
+      div5 = element("div");
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
       t6 = space();
-      div8 = element("div");
-      button1 = element("button");
+      div6 = element("div");
+      button2 = element("button");
       create_component(settings.$$.fragment);
       t7 = space();
-      span = element("span");
+      span1 = element("span");
       t8 = text$3(t8_value);
-      attr(a0, "class", "flex items-center rounded-xl w-[34px] h-[34px] justify-center hover:bg-gray-100/50 dark:hover:bg-gray-850/50 transition cursor-pointer");
-      attr(a1, "class", "flex flex-1 px-0.5 cursor-pointer");
-      attr(button0, "class", "p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 transition cursor-pointer");
-      attr(div3, "class", "flex items-center space-x-1");
-      attr(div4, "class", "px-[9px] pt-2 pb-1.5 flex justify-between space-x-1 text-gray-600 dark:text-gray-400 sticky top-0 z-1 -mb-3");
+      attr(button0, "class", "flex items-center gap-2 group cursor-pointer");
+      attr(button1, "class", "w-9 h-9 flex items-center justify-center rounded-full hover:bg-blue-500/10 dark:hover:bg-blue-400/10 transition-all cursor-pointer hover:scale-110 active:scale-95 border border-transparent hover:border-blue-500/20");
+      attr(div2, "class", "px-4 pt-4 pb-2 flex justify-between items-center text-gray-600 dark:text-gray-400");
       attr(input, "type", "text");
-      attr(input, "placeholder", "Search chats...");
-      attr(input, "class", "w-full pl-9 pr-3 py-2 bg-gray-100 dark:bg-gray-900 border-none rounded-xl text-sm outline-none focus:ring-1 focus:ring-gray-300 dark:focus:ring-gray-700 transition-all");
-      attr(div5, "class", "relative flex items-center");
-      attr(div6, "class", "px-3 pt-6 pb-2");
-      attr(div7, "class", "flex-1 overflow-y-auto px-2 py-2 space-y-0.5");
-      attr(button1, "class", "w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-900 transition-all text-sm font-medium text-gray-700 dark:text-gray-300 cursor-pointer");
-      attr(div8, "class", "p-2 mt-auto border-t border-gray-200 dark:border-gray-800");
-      attr(div9, "class", "w-[260px] h-full flex flex-col bg-gray-50 dark:bg-gray-950 transition-all duration-300 z-10 border-r border-gray-200 dark:border-gray-800");
+      attr(input, "placeholder", "Search conversations...");
+      attr(input, "class", "w-full pl-10 pr-4 py-2.5 bg-gray-500/5 dark:bg-white/5 border border-transparent focus:border-blue-500/30 rounded-2xl text-sm outline-none transition-all placeholder:text-gray-500");
+      attr(div3, "class", "relative flex items-center group");
+      attr(div4, "class", "px-4 py-4");
+      attr(div5, "class", "flex-1 overflow-y-auto px-3 py-2 space-y-1 custom-scrollbar");
+      attr(button2, "class", "w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-gray-600 dark:text-gray-400 hover:bg-white/10 dark:hover:bg-gray-800/50 transition-all text-sm font-semibold cursor-pointer group");
+      attr(div6, "class", "p-4 mt-auto border-t border-white/10");
+      attr(div7, "class", "w-[280px] h-full flex flex-col glass-effect-strong transition-all duration-500 z-50 border-r border-white/10");
     },
     m(target, anchor) {
-      insert(target, div9, anchor);
-      append(div9, div4);
-      append(div4, a0);
-      append(div4, t0);
-      append(div4, a1);
-      append(div4, t2);
+      insert(target, div7, anchor);
+      append(div7, div2);
+      append(div2, button0);
+      append(div2, t2);
+      append(div2, button1);
+      mount_component(plus, button1, null);
+      append(div7, t3);
+      append(div7, div4);
       append(div4, div3);
-      append(div3, button0);
-      mount_component(plus, button0, null);
-      append(div9, t3);
-      append(div9, div6);
-      append(div6, div5);
-      mount_component(search, div5, null);
-      append(div5, t4);
-      append(div5, input);
+      mount_component(search, div3, null);
+      append(div3, t4);
+      append(div3, input);
       set_input_value(
         input,
         /*searchQuery*/
         ctx[1]
       );
-      append(div9, t5);
-      append(div9, div7);
+      append(div7, t5);
+      append(div7, div5);
       for (let i = 0; i < each_blocks.length; i += 1) {
         if (each_blocks[i]) {
-          each_blocks[i].m(div7, null);
+          each_blocks[i].m(div5, null);
         }
       }
-      append(div9, t6);
-      append(div9, div8);
-      append(div8, button1);
-      mount_component(settings, button1, null);
-      append(button1, t7);
-      append(button1, span);
-      append(span, t8);
+      append(div7, t6);
+      append(div7, div6);
+      append(div6, button2);
+      mount_component(settings, button2, null);
+      append(button2, t7);
+      append(button2, span1);
+      append(span1, t8);
       current = true;
       if (!mounted) {
         dispose = [
           listen(
-            a0,
+            button0,
             "click",
             /*click_handler*/
             ctx[13]
           ),
           listen(
-            a1,
+            button1,
             "click",
             /*click_handler_1*/
             ctx[14]
           ),
           listen(
-            button0,
-            "click",
-            /*click_handler_2*/
-            ctx[15]
-          ),
-          listen(
             input,
             "input",
             /*input_input_handler*/
-            ctx[16]
+            ctx[15]
           ),
           listen(
-            button1,
+            button2,
             "click",
-            /*click_handler_8*/
-            ctx[22]
+            /*click_handler_7*/
+            ctx[21]
           )
         ];
         mounted = true;
@@ -4847,7 +5150,7 @@ function create_fragment$5(ctx) {
             each_blocks[i] = create_each_block$4(child_ctx);
             each_blocks[i].c();
             transition_in(each_blocks[i], 1);
-            each_blocks[i].m(div7, null);
+            each_blocks[i].m(div5, null);
           }
         }
         group_outros();
@@ -4882,7 +5185,7 @@ function create_fragment$5(ctx) {
     },
     d(detaching) {
       if (detaching) {
-        detach(div9);
+        detach(div7);
       }
       destroy_component(plus);
       destroy_component(search);
@@ -4901,12 +5204,12 @@ function instance$5($$self, $$props, $$invalidate) {
   component_subscribe($$self, currentConversationId, ($$value) => $$invalidate(4, $currentConversationId = $$value));
   let { plugin } = $$props;
   let { i18n } = $$props;
-  const dispatch = createEventDispatcher();
+  const dispatch2 = createEventDispatcher();
   let searchQuery = "";
   let openMenuId = null;
   function selectConversation(id) {
     currentConversationId.set(id);
-    dispatch("close");
+    dispatch2("close");
   }
   function handleDelete(id) {
     deleteConversation(id);
@@ -4990,26 +5293,22 @@ ${m.content}
   });
   const click_handler = () => {
     createNewConversation();
-    dispatch("close");
+    dispatch2("close");
   };
   const click_handler_1 = () => {
     createNewConversation();
-    dispatch("close");
-  };
-  const click_handler_2 = () => {
-    createNewConversation();
-    dispatch("close");
+    dispatch2("close");
   };
   function input_input_handler() {
     searchQuery = this.value;
     $$invalidate(1, searchQuery);
   }
-  const click_handler_3 = (conv, e) => toggleMenu(e, conv.id);
-  const click_handler_4 = (conv) => handleExportSiYuan(conv);
-  const click_handler_5 = (conv) => handleExportMarkdown(conv);
-  const click_handler_6 = (conv) => handleDelete(conv.id);
-  const click_handler_7 = (conv) => selectConversation(conv.id);
-  const click_handler_8 = () => dispatch("openSettings");
+  const click_handler_2 = (conv, e) => toggleMenu(e, conv.id);
+  const click_handler_3 = (conv) => handleExportSiYuan(conv);
+  const click_handler_4 = (conv) => handleExportMarkdown(conv);
+  const click_handler_5 = (conv) => handleDelete(conv.id);
+  const click_handler_6 = (conv) => selectConversation(conv.id);
+  const click_handler_7 = () => dispatch2("openSettings");
   $$self.$$set = ($$props2) => {
     if ("plugin" in $$props2) $$invalidate(11, plugin = $$props2.plugin);
     if ("i18n" in $$props2) $$invalidate(0, i18n = $$props2.i18n);
@@ -5026,7 +5325,7 @@ ${m.content}
     openMenuId,
     filteredConversations,
     $currentConversationId,
-    dispatch,
+    dispatch2,
     selectConversation,
     handleDelete,
     toggleMenu,
@@ -5036,14 +5335,13 @@ ${m.content}
     $conversations,
     click_handler,
     click_handler_1,
-    click_handler_2,
     input_input_handler,
+    click_handler_2,
     click_handler_3,
     click_handler_4,
     click_handler_5,
     click_handler_6,
-    click_handler_7,
-    click_handler_8
+    click_handler_7
   ];
 }
 class Sidebar extends SvelteComponent {
@@ -21345,6 +21643,76 @@ var katex = {
    */
   __domTree
 };
+const inlineRule = /^(\${1,2})(?!\$)((?:\\.|[^\\\n])*?(?:\\.|[^\\\n\$]))\1(?=[\s?!\.,:？！。，：]|$)/;
+const inlineRuleNonStandard = /^(\${1,2})(?!\$)((?:\\.|[^\\\n])*?(?:\\.|[^\\\n\$]))\1/;
+const blockRule = /^(\${1,2})\n((?:\\[^]|[^\\])+?)\n\1(?:\n|$)/;
+function markedKatex(options = {}) {
+  return {
+    extensions: [
+      inlineKatex(options, createRenderer(options, false)),
+      blockKatex(options, createRenderer(options, true))
+    ]
+  };
+}
+function createRenderer(options, newlineAfter) {
+  return (token) => katex.renderToString(token.text, { ...options, displayMode: token.displayMode }) + (newlineAfter ? "\n" : "");
+}
+function inlineKatex(options, renderer) {
+  const nonStandard = options && options.nonStandard;
+  const ruleReg = nonStandard ? inlineRuleNonStandard : inlineRule;
+  return {
+    name: "inlineKatex",
+    level: "inline",
+    start(src) {
+      let index;
+      let indexSrc = src;
+      while (indexSrc) {
+        index = indexSrc.indexOf("$");
+        if (index === -1) {
+          return;
+        }
+        const f = nonStandard ? index > -1 : index === 0 || indexSrc.charAt(index - 1) === " ";
+        if (f) {
+          const possibleKatex = indexSrc.substring(index);
+          if (possibleKatex.match(ruleReg)) {
+            return index;
+          }
+        }
+        indexSrc = indexSrc.substring(index + 1).replace(/^\$+/, "");
+      }
+    },
+    tokenizer(src, tokens) {
+      const match = src.match(ruleReg);
+      if (match) {
+        return {
+          type: "inlineKatex",
+          raw: match[0],
+          text: match[2].trim(),
+          displayMode: match[1].length === 2
+        };
+      }
+    },
+    renderer
+  };
+}
+function blockKatex(options, renderer) {
+  return {
+    name: "blockKatex",
+    level: "block",
+    tokenizer(src, tokens) {
+      const match = src.match(blockRule);
+      if (match) {
+        return {
+          type: "blockKatex",
+          raw: match[0],
+          text: match[2].trim(),
+          displayMode: match[1].length === 2
+        };
+      }
+    },
+    renderer
+  };
+}
 function markedHighlight(options) {
   if (typeof options === "function") {
     options = {
@@ -74465,10 +74833,10 @@ var purify = createDOMPurify();
 function get_each_context$3(ctx, list2, i) {
   const child_ctx = ctx.slice();
   child_ctx[12] = list2[i];
-  child_ctx[16] = i;
+  child_ctx[17] = i;
   const constants_0 = (
     /*index*/
-    child_ctx[16] === /*messages*/
+    child_ctx[17] === /*messages*/
     child_ctx[0].length - 1
   );
   child_ctx[13] = constants_0;
@@ -74479,39 +74847,101 @@ function get_each_context$3(ctx, list2, i) {
     child_ctx[1]
   );
   child_ctx[14] = constants_1;
+  const constants_2 = (
+    /*msg*/
+    child_ctx[12].role === "user"
+  );
+  child_ctx[15] = constants_2;
+  return child_ctx;
+}
+function get_each_context_3$1(ctx, list2, i) {
+  const child_ctx = ctx.slice();
+  child_ctx[18] = list2[i];
+  return child_ctx;
+}
+function get_each_context_4(ctx, list2, i) {
+  const child_ctx = ctx.slice();
+  child_ctx[21] = list2[i];
   return child_ctx;
 }
 function get_each_context_1$2(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[17] = list2[i];
+  child_ctx[18] = list2[i];
   return child_ctx;
 }
 function get_each_context_2$2(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[20] = list2[i];
+  child_ctx[21] = list2[i];
   return child_ctx;
 }
-function create_else_block$2(ctx) {
+function create_if_block_8(ctx) {
+  let div2;
+  let div1;
+  let div0;
+  let div0_class_value;
+  let t;
+  let if_block = (
+    /*isStreaming*/
+    ctx[14] && create_if_block_9()
+  );
+  return {
+    c() {
+      div2 = element("div");
+      div1 = element("div");
+      div0 = element("div");
+      t = space();
+      if (if_block) if_block.c();
+      attr(div0, "class", div0_class_value = "size-3 bg-white rounded-sm rotate-45 " + /*isStreaming*/
+      (ctx[14] ? "animate-spin" : ""));
+      attr(div1, "class", "size-8 rounded-xl flex items-center justify-center shadow-md transition-transform group-hover:scale-110 bg-gradient-to-br from-purple-500 to-purple-600 text-white relative");
+      attr(div2, "class", "shrink-0 mr-3 mt-0.5");
+    },
+    m(target, anchor) {
+      insert(target, div2, anchor);
+      append(div2, div1);
+      append(div1, div0);
+      append(div1, t);
+      if (if_block) if_block.m(div1, null);
+    },
+    p(ctx2, dirty) {
+      if (dirty & /*messages, isLoading*/
+      3 && div0_class_value !== (div0_class_value = "size-3 bg-white rounded-sm rotate-45 " + /*isStreaming*/
+      (ctx2[14] ? "animate-spin" : ""))) {
+        attr(div0, "class", div0_class_value);
+      }
+      if (
+        /*isStreaming*/
+        ctx2[14]
+      ) {
+        if (if_block) ;
+        else {
+          if_block = create_if_block_9();
+          if_block.c();
+          if_block.m(div1, null);
+        }
+      } else if (if_block) {
+        if_block.d(1);
+        if_block = null;
+      }
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(div2);
+      }
+      if (if_block) if_block.d();
+    }
+  };
+}
+function create_if_block_9(ctx) {
   let div;
-  let div_class_value;
   return {
     c() {
       div = element("div");
-      attr(div, "class", div_class_value = "w-3 h-3 bg-white dark:bg-black rounded-sm " + /*isStreaming*/
-      (ctx[14] ? "animate-pulse" : ""));
+      attr(div, "class", "absolute inset-0 bg-purple-200/30 rounded-xl animate-ping");
     },
     m(target, anchor) {
       insert(target, div, anchor);
     },
-    p(ctx2, dirty) {
-      if (dirty & /*messages, isLoading*/
-      3 && div_class_value !== (div_class_value = "w-3 h-3 bg-white dark:bg-black rounded-sm " + /*isStreaming*/
-      (ctx2[14] ? "animate-pulse" : ""))) {
-        attr(div, "class", div_class_value);
-      }
-    },
-    i: noop,
-    o: noop,
     d(detaching) {
       if (detaching) {
         detach(div);
@@ -74519,82 +74949,487 @@ function create_else_block$2(ctx) {
     }
   };
 }
-function create_if_block_4$1(ctx) {
-  let user;
+function create_else_block$3(ctx) {
+  let div;
+  let html_tag;
+  let raw_value = (
+    /*renderMarkdown*/
+    ctx[5](
+      /*msg*/
+      ctx[12].content
+    ) + ""
+  );
+  let t0;
+  let t1;
+  let t2;
   let current;
-  user = new User({ props: { size: 16 } });
+  let if_block0 = (
+    /*msg*/
+    ctx[12].images && /*msg*/
+    ctx[12].images.length > 0 && create_if_block_7(ctx)
+  );
+  let if_block1 = (
+    /*isStreaming*/
+    ctx[14] && !/*msg*/
+    ctx[12].content && create_if_block_6()
+  );
+  let if_block2 = (
+    /*msg*/
+    ctx[12].references && /*msg*/
+    ctx[12].references.length > 0 && create_if_block_5$1(ctx)
+  );
   return {
     c() {
-      create_component(user.$$.fragment);
+      div = element("div");
+      html_tag = new HtmlTag(false);
+      t0 = space();
+      if (if_block0) if_block0.c();
+      t1 = space();
+      if (if_block1) if_block1.c();
+      t2 = space();
+      if (if_block2) if_block2.c();
+      html_tag.a = t0;
+      attr(div, "class", "w-full min-w-full markdown-prose prose dark:prose-invert prose-base max-w-none leading-relaxed");
     },
     m(target, anchor) {
-      mount_component(user, target, anchor);
+      insert(target, div, anchor);
+      html_tag.m(raw_value, div);
+      append(div, t0);
+      if (if_block0) if_block0.m(div, null);
+      append(div, t1);
+      if (if_block1) if_block1.m(div, null);
+      append(div, t2);
+      if (if_block2) if_block2.m(div, null);
       current = true;
     },
-    p: noop,
-    i(local) {
-      if (current) return;
-      transition_in(user.$$.fragment, local);
-      current = true;
-    },
-    o(local) {
-      transition_out(user.$$.fragment, local);
-      current = false;
-    },
-    d(detaching) {
-      destroy_component(user, detaching);
-    }
-  };
-}
-function create_if_block_3$3(ctx) {
-  let button;
-  let rotateccw;
-  let current;
-  let mounted;
-  let dispose;
-  rotateccw = new Rotate_ccw({ props: { size: 14 } });
-  return {
-    c() {
-      button = element("button");
-      create_component(rotateccw.$$.fragment);
-      attr(button, "class", "p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors cursor-pointer");
-      attr(button, "title", "Regenerate response");
-    },
-    m(target, anchor) {
-      insert(target, button, anchor);
-      mount_component(rotateccw, button, null);
-      current = true;
-      if (!mounted) {
-        dispose = listen(
-          button,
-          "click",
-          /*handleRegenerate*/
-          ctx[6]
-        );
-        mounted = true;
+    p(ctx2, dirty) {
+      if ((!current || dirty & /*messages*/
+      1) && raw_value !== (raw_value = /*renderMarkdown*/
+      ctx2[5](
+        /*msg*/
+        ctx2[12].content
+      ) + "")) html_tag.p(raw_value);
+      if (
+        /*msg*/
+        ctx2[12].images && /*msg*/
+        ctx2[12].images.length > 0
+      ) {
+        if (if_block0) {
+          if_block0.p(ctx2, dirty);
+        } else {
+          if_block0 = create_if_block_7(ctx2);
+          if_block0.c();
+          if_block0.m(div, t1);
+        }
+      } else if (if_block0) {
+        if_block0.d(1);
+        if_block0 = null;
+      }
+      if (
+        /*isStreaming*/
+        ctx2[14] && !/*msg*/
+        ctx2[12].content
+      ) {
+        if (if_block1) ;
+        else {
+          if_block1 = create_if_block_6();
+          if_block1.c();
+          if_block1.m(div, t2);
+        }
+      } else if (if_block1) {
+        if_block1.d(1);
+        if_block1 = null;
+      }
+      if (
+        /*msg*/
+        ctx2[12].references && /*msg*/
+        ctx2[12].references.length > 0
+      ) {
+        if (if_block2) {
+          if_block2.p(ctx2, dirty);
+          if (dirty & /*messages*/
+          1) {
+            transition_in(if_block2, 1);
+          }
+        } else {
+          if_block2 = create_if_block_5$1(ctx2);
+          if_block2.c();
+          transition_in(if_block2, 1);
+          if_block2.m(div, null);
+        }
+      } else if (if_block2) {
+        group_outros();
+        transition_out(if_block2, 1, 1, () => {
+          if_block2 = null;
+        });
+        check_outros();
       }
     },
-    p: noop,
     i(local) {
       if (current) return;
-      transition_in(rotateccw.$$.fragment, local);
+      transition_in(if_block2);
       current = true;
     },
     o(local) {
-      transition_out(rotateccw.$$.fragment, local);
+      transition_out(if_block2);
       current = false;
     },
     d(detaching) {
       if (detaching) {
-        detach(button);
+        detach(div);
       }
-      destroy_component(rotateccw);
-      mounted = false;
-      dispose();
+      if (if_block0) if_block0.d();
+      if (if_block1) if_block1.d();
+      if (if_block2) if_block2.d();
     }
   };
 }
 function create_if_block_2$3(ctx) {
+  let div1;
+  let div0;
+  let t0_value = (
+    /*msg*/
+    ctx[12].content + ""
+  );
+  let t0;
+  let t1;
+  let t2;
+  let current;
+  let if_block0 = (
+    /*msg*/
+    ctx[12].images && /*msg*/
+    ctx[12].images.length > 0 && create_if_block_4$2(ctx)
+  );
+  let if_block1 = (
+    /*msg*/
+    ctx[12].references && /*msg*/
+    ctx[12].references.length > 0 && create_if_block_3$3(ctx)
+  );
+  return {
+    c() {
+      div1 = element("div");
+      div0 = element("div");
+      t0 = text$3(t0_value);
+      t1 = space();
+      if (if_block0) if_block0.c();
+      t2 = space();
+      if (if_block1) if_block1.c();
+      attr(div0, "class", "leading-relaxed");
+      attr(div1, "class", "px-3.5 py-2.5 rounded-2xl bg-blue-500/10 dark:bg-blue-400/10 border border-blue-500/20 dark:border-blue-400/20 shadow-md shadow-blue-500/5 dark:shadow-blue-400/5");
+    },
+    m(target, anchor) {
+      insert(target, div1, anchor);
+      append(div1, div0);
+      append(div0, t0);
+      append(div1, t1);
+      if (if_block0) if_block0.m(div1, null);
+      append(div1, t2);
+      if (if_block1) if_block1.m(div1, null);
+      current = true;
+    },
+    p(ctx2, dirty) {
+      if ((!current || dirty & /*messages*/
+      1) && t0_value !== (t0_value = /*msg*/
+      ctx2[12].content + "")) set_data(t0, t0_value);
+      if (
+        /*msg*/
+        ctx2[12].images && /*msg*/
+        ctx2[12].images.length > 0
+      ) {
+        if (if_block0) {
+          if_block0.p(ctx2, dirty);
+        } else {
+          if_block0 = create_if_block_4$2(ctx2);
+          if_block0.c();
+          if_block0.m(div1, t2);
+        }
+      } else if (if_block0) {
+        if_block0.d(1);
+        if_block0 = null;
+      }
+      if (
+        /*msg*/
+        ctx2[12].references && /*msg*/
+        ctx2[12].references.length > 0
+      ) {
+        if (if_block1) {
+          if_block1.p(ctx2, dirty);
+          if (dirty & /*messages*/
+          1) {
+            transition_in(if_block1, 1);
+          }
+        } else {
+          if_block1 = create_if_block_3$3(ctx2);
+          if_block1.c();
+          transition_in(if_block1, 1);
+          if_block1.m(div1, null);
+        }
+      } else if (if_block1) {
+        group_outros();
+        transition_out(if_block1, 1, 1, () => {
+          if_block1 = null;
+        });
+        check_outros();
+      }
+    },
+    i(local) {
+      if (current) return;
+      transition_in(if_block1);
+      current = true;
+    },
+    o(local) {
+      transition_out(if_block1);
+      current = false;
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(div1);
+      }
+      if (if_block0) if_block0.d();
+      if (if_block1) if_block1.d();
+    }
+  };
+}
+function create_if_block_7(ctx) {
+  let div;
+  let each_value_4 = ensure_array_like(
+    /*msg*/
+    ctx[12].images
+  );
+  let each_blocks = [];
+  for (let i = 0; i < each_value_4.length; i += 1) {
+    each_blocks[i] = create_each_block_4(get_each_context_4(ctx, each_value_4, i));
+  }
+  return {
+    c() {
+      div = element("div");
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        each_blocks[i].c();
+      }
+      attr(div, "class", "mt-4 flex flex-wrap gap-3");
+    },
+    m(target, anchor) {
+      insert(target, div, anchor);
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        if (each_blocks[i]) {
+          each_blocks[i].m(div, null);
+        }
+      }
+    },
+    p(ctx2, dirty) {
+      if (dirty & /*messages*/
+      1) {
+        each_value_4 = ensure_array_like(
+          /*msg*/
+          ctx2[12].images
+        );
+        let i;
+        for (i = 0; i < each_value_4.length; i += 1) {
+          const child_ctx = get_each_context_4(ctx2, each_value_4, i);
+          if (each_blocks[i]) {
+            each_blocks[i].p(child_ctx, dirty);
+          } else {
+            each_blocks[i] = create_each_block_4(child_ctx);
+            each_blocks[i].c();
+            each_blocks[i].m(div, null);
+          }
+        }
+        for (; i < each_blocks.length; i += 1) {
+          each_blocks[i].d(1);
+        }
+        each_blocks.length = each_value_4.length;
+      }
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(div);
+      }
+      destroy_each(each_blocks, detaching);
+    }
+  };
+}
+function create_each_block_4(ctx) {
+  let img_1;
+  let img_1_src_value;
+  return {
+    c() {
+      img_1 = element("img");
+      if (!src_url_equal(img_1.src, img_1_src_value = /*img*/
+      ctx[21])) attr(img_1, "src", img_1_src_value);
+      attr(img_1, "alt", "Attachment");
+      attr(img_1, "class", "rounded-3xl border border-white/10 shadow-2xl max-h-[400px] object-contain bg-white/5 backdrop-blur-sm");
+    },
+    m(target, anchor) {
+      insert(target, img_1, anchor);
+    },
+    p(ctx2, dirty) {
+      if (dirty & /*messages*/
+      1 && !src_url_equal(img_1.src, img_1_src_value = /*img*/
+      ctx2[21])) {
+        attr(img_1, "src", img_1_src_value);
+      }
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(img_1);
+      }
+    }
+  };
+}
+function create_if_block_6(ctx) {
+  let div;
+  return {
+    c() {
+      div = element("div");
+      div.innerHTML = `<span class="w-2 h-2 bg-current rounded-full animate-bounce"></span> <span class="w-2 h-2 bg-current rounded-full animate-bounce" style="animation-delay: 0.2s"></span> <span class="w-2 h-2 bg-current rounded-full animate-bounce" style="animation-delay: 0.4s"></span>`;
+      attr(div, "class", "mt-4 flex items-center gap-2 text-blue-500");
+    },
+    m(target, anchor) {
+      insert(target, div, anchor);
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(div);
+      }
+    }
+  };
+}
+function create_if_block_5$1(ctx) {
+  let div;
+  let current;
+  let each_value_3 = ensure_array_like(
+    /*msg*/
+    ctx[12].references
+  );
+  let each_blocks = [];
+  for (let i = 0; i < each_value_3.length; i += 1) {
+    each_blocks[i] = create_each_block_3$1(get_each_context_3$1(ctx, each_value_3, i));
+  }
+  const out = (i) => transition_out(each_blocks[i], 1, 1, () => {
+    each_blocks[i] = null;
+  });
+  return {
+    c() {
+      div = element("div");
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        each_blocks[i].c();
+      }
+      attr(div, "class", "mt-6 flex flex-wrap gap-3 animate-in fade-in duration-700");
+    },
+    m(target, anchor) {
+      insert(target, div, anchor);
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        if (each_blocks[i]) {
+          each_blocks[i].m(div, null);
+        }
+      }
+      current = true;
+    },
+    p(ctx2, dirty) {
+      if (dirty & /*messages*/
+      1) {
+        each_value_3 = ensure_array_like(
+          /*msg*/
+          ctx2[12].references
+        );
+        let i;
+        for (i = 0; i < each_value_3.length; i += 1) {
+          const child_ctx = get_each_context_3$1(ctx2, each_value_3, i);
+          if (each_blocks[i]) {
+            each_blocks[i].p(child_ctx, dirty);
+            transition_in(each_blocks[i], 1);
+          } else {
+            each_blocks[i] = create_each_block_3$1(child_ctx);
+            each_blocks[i].c();
+            transition_in(each_blocks[i], 1);
+            each_blocks[i].m(div, null);
+          }
+        }
+        group_outros();
+        for (i = each_value_3.length; i < each_blocks.length; i += 1) {
+          out(i);
+        }
+        check_outros();
+      }
+    },
+    i(local) {
+      if (current) return;
+      for (let i = 0; i < each_value_3.length; i += 1) {
+        transition_in(each_blocks[i]);
+      }
+      current = true;
+    },
+    o(local) {
+      each_blocks = each_blocks.filter(Boolean);
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        transition_out(each_blocks[i]);
+      }
+      current = false;
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(div);
+      }
+      destroy_each(each_blocks, detaching);
+    }
+  };
+}
+function create_each_block_3$1(ctx) {
+  let div;
+  let filetext;
+  let t0;
+  let span;
+  let t1_value = (
+    /*ref*/
+    ctx[18].title + ""
+  );
+  let t1;
+  let t2;
+  let current;
+  filetext = new File_text({ props: { size: 16, class: "shrink-0" } });
+  return {
+    c() {
+      div = element("div");
+      create_component(filetext.$$.fragment);
+      t0 = space();
+      span = element("span");
+      t1 = text$3(t1_value);
+      t2 = space();
+      attr(span, "class", "truncate max-w-[240px]");
+      attr(div, "class", "flex items-center gap-2 px-4 py-2 bg-blue-500/5 border border-blue-500/10 rounded-2xl text-xs font-bold text-blue-600 dark:text-blue-400 w-fit cursor-pointer hover:bg-blue-500/10 hover:border-blue-500/30 transition-all hover:scale-105 active:scale-95 shadow-sm");
+    },
+    m(target, anchor) {
+      insert(target, div, anchor);
+      mount_component(filetext, div, null);
+      append(div, t0);
+      append(div, span);
+      append(span, t1);
+      append(div, t2);
+      current = true;
+    },
+    p(ctx2, dirty) {
+      if ((!current || dirty & /*messages*/
+      1) && t1_value !== (t1_value = /*ref*/
+      ctx2[18].title + "")) set_data(t1, t1_value);
+    },
+    i(local) {
+      if (current) return;
+      transition_in(filetext.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(filetext.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(div);
+      }
+      destroy_component(filetext);
+    }
+  };
+}
+function create_if_block_4$2(ctx) {
   let div;
   let each_value_2 = ensure_array_like(
     /*msg*/
@@ -74653,59 +75488,34 @@ function create_if_block_2$3(ctx) {
   };
 }
 function create_each_block_2$2(ctx) {
-  let div;
   let img_1;
   let img_1_src_value;
-  let t;
   return {
     c() {
-      div = element("div");
       img_1 = element("img");
-      t = space();
       if (!src_url_equal(img_1.src, img_1_src_value = /*img*/
-      ctx[20])) attr(img_1, "src", img_1_src_value);
-      attr(img_1, "alt", "Message attachment");
-      attr(img_1, "class", "rounded-xl border border-gray-100 dark:border-gray-800 shadow-sm max-h-[300px] object-contain bg-gray-50 dark:bg-gray-900");
-      attr(div, "class", "relative group max-w-sm");
+      ctx[21])) attr(img_1, "src", img_1_src_value);
+      attr(img_1, "alt", "Attachment");
+      attr(img_1, "class", "rounded-xl max-h-[200px] object-contain");
     },
     m(target, anchor) {
-      insert(target, div, anchor);
-      append(div, img_1);
-      append(div, t);
+      insert(target, img_1, anchor);
     },
     p(ctx2, dirty) {
       if (dirty & /*messages*/
       1 && !src_url_equal(img_1.src, img_1_src_value = /*img*/
-      ctx2[20])) {
+      ctx2[21])) {
         attr(img_1, "src", img_1_src_value);
       }
     },
     d(detaching) {
       if (detaching) {
-        detach(div);
+        detach(img_1);
       }
     }
   };
 }
-function create_if_block_1$3(ctx) {
-  let div;
-  return {
-    c() {
-      div = element("div");
-      div.innerHTML = `<span class="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"></span> <span class="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style="animation-delay: 0.2s"></span> <span class="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style="animation-delay: 0.4s"></span>`;
-      attr(div, "class", "mt-1 flex items-center gap-1.5 text-gray-400");
-    },
-    m(target, anchor) {
-      insert(target, div, anchor);
-    },
-    d(detaching) {
-      if (detaching) {
-        detach(div);
-      }
-    }
-  };
-}
-function create_if_block$4(ctx) {
+function create_if_block_3$3(ctx) {
   let div;
   let current;
   let each_value_1 = ensure_array_like(
@@ -74725,7 +75535,7 @@ function create_if_block$4(ctx) {
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
-      attr(div, "class", "mb-1 w-full flex flex-col justify-end overflow-x-auto gap-1 flex-wrap mt-3");
+      attr(div, "class", "mt-3 flex flex-wrap gap-2");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -74792,14 +75602,12 @@ function create_each_block_1$2(ctx) {
   let span;
   let t1_value = (
     /*ref*/
-    ctx[17].title + ""
+    ctx[18].title + ""
   );
   let t1;
   let t2;
   let current;
-  filetext = new File_text({
-    props: { size: 14, class: "text-gray-500" }
-  });
+  filetext = new File_text({ props: { size: 12, class: "shrink-0" } });
   return {
     c() {
       div = element("div");
@@ -74809,7 +75617,7 @@ function create_each_block_1$2(ctx) {
       t1 = text$3(t1_value);
       t2 = space();
       attr(span, "class", "truncate max-w-[200px]");
-      attr(div, "class", "flex items-center gap-1.5 px-3 py-1.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-800 rounded-xl text-xs font-medium text-gray-700 dark:text-gray-300 w-fit cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors");
+      attr(div, "class", "flex items-center gap-1.5 px-3 py-1.5 bg-blue-500/10 border border-blue-500/20 rounded-xl text-xs font-bold text-blue-600 dark:text-blue-400");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -74823,7 +75631,7 @@ function create_each_block_1$2(ctx) {
     p(ctx2, dirty) {
       if ((!current || dirty & /*messages*/
       1) && t1_value !== (t1_value = /*ref*/
-      ctx2[17].title + "")) set_data(t1, t1_value);
+      ctx2[18].title + "")) set_data(t1, t1_value);
     },
     i(local) {
       if (current) return;
@@ -74842,159 +75650,183 @@ function create_each_block_1$2(ctx) {
     }
   };
 }
-function create_each_block$3(ctx) {
-  let div7;
-  let div1;
-  let div0;
-  let current_block_type_index;
-  let if_block0;
-  let div0_class_value;
-  let t0;
-  let div6;
-  let div4;
-  let div2;
-  let t1_value = (
-    /*msg*/
-    ctx[12].role === "user" ? "You" : "Assistant"
-  );
-  let t1;
-  let t2;
-  let div3;
-  let t3;
+function create_if_block_1$3(ctx) {
   let button;
-  let trash2;
-  let t4;
-  let div5;
-  let html_tag;
-  let raw_value = (
-    /*renderMarkdown*/
-    ctx[5](
-      /*msg*/
-      ctx[12].content,
-      /*isStreaming*/
-      ctx[14]
-    ) + ""
-  );
-  let t5;
-  let t6;
-  let t7;
-  let div5_class_value;
-  let t8;
-  let div7_class_value;
+  let rotateccw;
   let current;
   let mounted;
   let dispose;
-  const if_block_creators = [create_if_block_4$1, create_else_block$2];
+  rotateccw = new Rotate_ccw({ props: { size: 12 } });
+  return {
+    c() {
+      button = element("button");
+      create_component(rotateccw.$$.fragment);
+      attr(button, "class", "p-1 rounded-md text-gray-400 hover:text-blue-500 transition-all cursor-pointer");
+      attr(button, "title", "Regenerate");
+    },
+    m(target, anchor) {
+      insert(target, button, anchor);
+      mount_component(rotateccw, button, null);
+      current = true;
+      if (!mounted) {
+        dispose = listen(
+          button,
+          "click",
+          /*handleRegenerate*/
+          ctx[6]
+        );
+        mounted = true;
+      }
+    },
+    p: noop,
+    i(local) {
+      if (current) return;
+      transition_in(rotateccw.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(rotateccw.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(button);
+      }
+      destroy_component(rotateccw);
+      mounted = false;
+      dispose();
+    }
+  };
+}
+function create_if_block$4(ctx) {
+  let div1;
+  let div0;
+  let user;
+  let current;
+  user = new User({ props: { size: 16, strokeWidth: 2.5 } });
+  return {
+    c() {
+      div1 = element("div");
+      div0 = element("div");
+      create_component(user.$$.fragment);
+      attr(div0, "class", "size-8 rounded-xl flex items-center justify-center shadow-md transition-transform group-hover:scale-110 bg-gradient-to-br from-blue-500 to-blue-600 text-white");
+      attr(div1, "class", "shrink-0 ml-3 mt-0.5");
+    },
+    m(target, anchor) {
+      insert(target, div1, anchor);
+      append(div1, div0);
+      mount_component(user, div0, null);
+      current = true;
+    },
+    i(local) {
+      if (current) return;
+      transition_in(user.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(user.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(div1);
+      }
+      destroy_component(user);
+    }
+  };
+}
+function create_each_block$3(ctx) {
+  let div2;
+  let t0;
+  let div1;
+  let current_block_type_index;
+  let if_block1;
+  let t1;
+  let div0;
+  let t2;
+  let button;
+  let trash2;
+  let div1_class_value;
+  let t3;
+  let t4;
+  let div2_class_value;
+  let current;
+  let mounted;
+  let dispose;
+  let if_block0 = !/*isUser*/
+  ctx[15] && create_if_block_8(ctx);
+  const if_block_creators = [create_if_block_2$3, create_else_block$3];
   const if_blocks = [];
   function select_block_type(ctx2, dirty) {
     if (
-      /*msg*/
-      ctx2[12].role === "user"
+      /*isUser*/
+      ctx2[15]
     ) return 0;
     return 1;
   }
   current_block_type_index = select_block_type(ctx);
-  if_block0 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
-  let if_block1 = (
+  if_block1 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+  let if_block2 = (
     /*msg*/
     ctx[12].role === "assistant" && /*isLast*/
     ctx[13] && !/*isLoading*/
-    ctx[1] && create_if_block_3$3(ctx)
+    ctx[1] && create_if_block_1$3(ctx)
   );
-  trash2 = new Trash_2({ props: { size: 14 } });
+  trash2 = new Trash_2({ props: { size: 12 } });
   function click_handler() {
     return (
       /*click_handler*/
-      ctx[7](
+      ctx[8](
         /*index*/
-        ctx[16]
+        ctx[17]
       )
     );
   }
-  let if_block2 = (
-    /*msg*/
-    ctx[12].images && /*msg*/
-    ctx[12].images.length > 0 && create_if_block_2$3(ctx)
-  );
   let if_block3 = (
-    /*isStreaming*/
-    ctx[14] && !/*msg*/
-    ctx[12].content && create_if_block_1$3()
-  );
-  let if_block4 = (
-    /*msg*/
-    ctx[12].references && /*msg*/
-    ctx[12].references.length > 0 && create_if_block$4(ctx)
+    /*isUser*/
+    ctx[15] && create_if_block$4()
   );
   return {
     c() {
-      div7 = element("div");
-      div1 = element("div");
-      div0 = element("div");
-      if_block0.c();
-      t0 = space();
-      div6 = element("div");
-      div4 = element("div");
       div2 = element("div");
-      t1 = text$3(t1_value);
+      if (if_block0) if_block0.c();
+      t0 = space();
+      div1 = element("div");
+      if_block1.c();
+      t1 = space();
+      div0 = element("div");
+      if (if_block2) if_block2.c();
       t2 = space();
-      div3 = element("div");
-      if (if_block1) if_block1.c();
-      t3 = space();
       button = element("button");
       create_component(trash2.$$.fragment);
-      t4 = space();
-      div5 = element("div");
-      html_tag = new HtmlTag(false);
-      t5 = space();
-      if (if_block2) if_block2.c();
-      t6 = space();
+      t3 = space();
       if (if_block3) if_block3.c();
-      t7 = space();
-      if (if_block4) if_block4.c();
-      t8 = space();
-      attr(div0, "class", div0_class_value = "size-8 rounded-full flex items-center justify-center " + /*msg*/
-      (ctx[12].role === "user" ? "bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-100" : "bg-black dark:bg-white text-white dark:text-black"));
-      attr(div1, "class", "shrink-0 mr-3 hidden sm:flex mt-1");
-      attr(div2, "class", "font-semibold text-gray-850 dark:text-gray-200");
-      attr(button, "class", "p-1 text-gray-400 hover:text-red-500 transition-colors cursor-pointer");
-      attr(button, "title", "Delete message");
-      attr(div3, "class", "flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity");
-      attr(div4, "class", "flex items-center justify-between mb-0.5");
-      html_tag.a = t5;
-      attr(div5, "class", div5_class_value = "chat-" + /*msg*/
-      ctx[12].role + " w-full min-w-full markdown-prose prose dark:prose-invert prose-sm max-w-none");
-      attr(div6, "class", "flex-auto w-0 pl-1 relative");
-      attr(div7, "class", div7_class_value = "group flex w-full message-" + /*msg*/
-      ctx[12].role);
-      attr(div7, "dir", "auto");
+      t4 = space();
+      attr(button, "class", "p-1 rounded-md text-gray-400 hover:text-red-500 transition-all cursor-pointer");
+      attr(button, "title", "Delete");
+      attr(div0, "class", "flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-all");
+      attr(div1, "class", div1_class_value = /*isUser*/
+      (ctx[15] ? "max-w-[75%]" : "flex-auto min-w-0") + " relative");
+      attr(div2, "class", div2_class_value = "group flex w-full " + /*isUser*/
+      (ctx[15] ? "justify-end" : "") + " " + (!/*isStreaming*/
+      ctx[14] ? "animate-in fade-in slide-in-from-bottom-8 duration-500" : ""));
+      attr(div2, "dir", "auto");
     },
     m(target, anchor) {
-      insert(target, div7, anchor);
-      append(div7, div1);
+      insert(target, div2, anchor);
+      if (if_block0) if_block0.m(div2, null);
+      append(div2, t0);
+      append(div2, div1);
+      if_blocks[current_block_type_index].m(div1, null);
+      append(div1, t1);
       append(div1, div0);
-      if_blocks[current_block_type_index].m(div0, null);
-      append(div7, t0);
-      append(div7, div6);
-      append(div6, div4);
-      append(div4, div2);
-      append(div2, t1);
-      append(div4, t2);
-      append(div4, div3);
-      if (if_block1) if_block1.m(div3, null);
-      append(div3, t3);
-      append(div3, button);
+      if (if_block2) if_block2.m(div0, null);
+      append(div0, t2);
+      append(div0, button);
       mount_component(trash2, button, null);
-      append(div6, t4);
-      append(div6, div5);
-      html_tag.m(raw_value, div5);
-      append(div5, t5);
-      if (if_block2) if_block2.m(div5, null);
-      append(div5, t6);
-      if (if_block3) if_block3.m(div5, null);
-      append(div5, t7);
-      if (if_block4) if_block4.m(div5, null);
-      append(div7, t8);
+      append(div2, t3);
+      if (if_block3) if_block3.m(div2, null);
+      append(div2, t4);
       current = true;
       if (!mounted) {
         dispose = listen(button, "click", click_handler);
@@ -75003,6 +75835,19 @@ function create_each_block$3(ctx) {
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
+      if (!/*isUser*/
+      ctx[15]) {
+        if (if_block0) {
+          if_block0.p(ctx, dirty);
+        } else {
+          if_block0 = create_if_block_8(ctx);
+          if_block0.c();
+          if_block0.m(div2, t0);
+        }
+      } else if (if_block0) {
+        if_block0.d(1);
+        if_block0 = null;
+      }
       let previous_block_index = current_block_type_index;
       current_block_type_index = select_block_type(ctx);
       if (current_block_type_index === previous_block_index) {
@@ -75013,148 +75858,99 @@ function create_each_block$3(ctx) {
           if_blocks[previous_block_index] = null;
         });
         check_outros();
-        if_block0 = if_blocks[current_block_type_index];
-        if (!if_block0) {
-          if_block0 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
-          if_block0.c();
+        if_block1 = if_blocks[current_block_type_index];
+        if (!if_block1) {
+          if_block1 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+          if_block1.c();
         } else {
-          if_block0.p(ctx, dirty);
+          if_block1.p(ctx, dirty);
         }
-        transition_in(if_block0, 1);
-        if_block0.m(div0, null);
+        transition_in(if_block1, 1);
+        if_block1.m(div1, t1);
       }
-      if (!current || dirty & /*messages*/
-      1 && div0_class_value !== (div0_class_value = "size-8 rounded-full flex items-center justify-center " + /*msg*/
-      (ctx[12].role === "user" ? "bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-100" : "bg-black dark:bg-white text-white dark:text-black"))) {
-        attr(div0, "class", div0_class_value);
-      }
-      if ((!current || dirty & /*messages*/
-      1) && t1_value !== (t1_value = /*msg*/
-      ctx[12].role === "user" ? "You" : "Assistant")) set_data(t1, t1_value);
       if (
         /*msg*/
         ctx[12].role === "assistant" && /*isLast*/
         ctx[13] && !/*isLoading*/
         ctx[1]
       ) {
-        if (if_block1) {
-          if_block1.p(ctx, dirty);
-          if (dirty & /*messages, isLoading*/
-          3) {
-            transition_in(if_block1, 1);
-          }
-        } else {
-          if_block1 = create_if_block_3$3(ctx);
-          if_block1.c();
-          transition_in(if_block1, 1);
-          if_block1.m(div3, t3);
-        }
-      } else if (if_block1) {
-        group_outros();
-        transition_out(if_block1, 1, 1, () => {
-          if_block1 = null;
-        });
-        check_outros();
-      }
-      if ((!current || dirty & /*messages, isLoading*/
-      3) && raw_value !== (raw_value = /*renderMarkdown*/
-      ctx[5](
-        /*msg*/
-        ctx[12].content,
-        /*isStreaming*/
-        ctx[14]
-      ) + "")) html_tag.p(raw_value);
-      if (
-        /*msg*/
-        ctx[12].images && /*msg*/
-        ctx[12].images.length > 0
-      ) {
         if (if_block2) {
           if_block2.p(ctx, dirty);
-        } else {
-          if_block2 = create_if_block_2$3(ctx);
-          if_block2.c();
-          if_block2.m(div5, t6);
-        }
-      } else if (if_block2) {
-        if_block2.d(1);
-        if_block2 = null;
-      }
-      if (
-        /*isStreaming*/
-        ctx[14] && !/*msg*/
-        ctx[12].content
-      ) {
-        if (if_block3) ;
-        else {
-          if_block3 = create_if_block_1$3();
-          if_block3.c();
-          if_block3.m(div5, t7);
-        }
-      } else if (if_block3) {
-        if_block3.d(1);
-        if_block3 = null;
-      }
-      if (
-        /*msg*/
-        ctx[12].references && /*msg*/
-        ctx[12].references.length > 0
-      ) {
-        if (if_block4) {
-          if_block4.p(ctx, dirty);
-          if (dirty & /*messages*/
-          1) {
-            transition_in(if_block4, 1);
+          if (dirty & /*messages, isLoading*/
+          3) {
+            transition_in(if_block2, 1);
           }
         } else {
-          if_block4 = create_if_block$4(ctx);
-          if_block4.c();
-          transition_in(if_block4, 1);
-          if_block4.m(div5, null);
+          if_block2 = create_if_block_1$3(ctx);
+          if_block2.c();
+          transition_in(if_block2, 1);
+          if_block2.m(div0, t2);
         }
-      } else if (if_block4) {
+      } else if (if_block2) {
         group_outros();
-        transition_out(if_block4, 1, 1, () => {
-          if_block4 = null;
+        transition_out(if_block2, 1, 1, () => {
+          if_block2 = null;
         });
         check_outros();
       }
       if (!current || dirty & /*messages*/
-      1 && div5_class_value !== (div5_class_value = "chat-" + /*msg*/
-      ctx[12].role + " w-full min-w-full markdown-prose prose dark:prose-invert prose-sm max-w-none")) {
-        attr(div5, "class", div5_class_value);
+      1 && div1_class_value !== (div1_class_value = /*isUser*/
+      (ctx[15] ? "max-w-[75%]" : "flex-auto min-w-0") + " relative")) {
+        attr(div1, "class", div1_class_value);
       }
-      if (!current || dirty & /*messages*/
-      1 && div7_class_value !== (div7_class_value = "group flex w-full message-" + /*msg*/
-      ctx[12].role)) {
-        attr(div7, "class", div7_class_value);
+      if (
+        /*isUser*/
+        ctx[15]
+      ) {
+        if (if_block3) {
+          if (dirty & /*messages*/
+          1) {
+            transition_in(if_block3, 1);
+          }
+        } else {
+          if_block3 = create_if_block$4();
+          if_block3.c();
+          transition_in(if_block3, 1);
+          if_block3.m(div2, t4);
+        }
+      } else if (if_block3) {
+        group_outros();
+        transition_out(if_block3, 1, 1, () => {
+          if_block3 = null;
+        });
+        check_outros();
+      }
+      if (!current || dirty & /*messages, isLoading*/
+      3 && div2_class_value !== (div2_class_value = "group flex w-full " + /*isUser*/
+      (ctx[15] ? "justify-end" : "") + " " + (!/*isStreaming*/
+      ctx[14] ? "animate-in fade-in slide-in-from-bottom-8 duration-500" : ""))) {
+        attr(div2, "class", div2_class_value);
       }
     },
     i(local) {
       if (current) return;
-      transition_in(if_block0);
       transition_in(if_block1);
+      transition_in(if_block2);
       transition_in(trash2.$$.fragment, local);
-      transition_in(if_block4);
+      transition_in(if_block3);
       current = true;
     },
     o(local) {
-      transition_out(if_block0);
       transition_out(if_block1);
+      transition_out(if_block2);
       transition_out(trash2.$$.fragment, local);
-      transition_out(if_block4);
+      transition_out(if_block3);
       current = false;
     },
     d(detaching) {
       if (detaching) {
-        detach(div7);
+        detach(div2);
       }
+      if (if_block0) if_block0.d();
       if_blocks[current_block_type_index].d();
-      if (if_block1) if_block1.d();
-      destroy_component(trash2);
       if (if_block2) if_block2.d();
+      destroy_component(trash2);
       if (if_block3) if_block3.d();
-      if (if_block4) if_block4.d();
       mounted = false;
       dispose();
     }
@@ -75184,8 +75980,8 @@ function create_fragment$4(ctx) {
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
-      attr(div0, "class", "max-w-3xl w-full flex flex-col gap-6");
-      attr(div1, "class", "flex-1 overflow-y-auto w-full flex flex-col px-4 py-6 scroll-smooth items-center");
+      attr(div0, "class", "max-w-4xl w-full flex flex-col gap-8");
+      attr(div1, "class", "flex-1 overflow-y-auto w-full flex flex-col px-4 py-8 scroll-smooth items-center custom-scrollbar");
     },
     m(target, anchor) {
       insert(target, div1, anchor);
@@ -75195,7 +75991,7 @@ function create_fragment$4(ctx) {
           each_blocks[i].m(div0, null);
         }
       }
-      ctx[8](div1);
+      ctx[9](div1);
       current = true;
       if (!mounted) {
         dispose = listen(
@@ -75208,7 +76004,7 @@ function create_fragment$4(ctx) {
       }
     },
     p(ctx2, [dirty]) {
-      if (dirty & /*messages, isLoading, renderMarkdown, $currentConversationId, handleRegenerate*/
+      if (dirty & /*messages, isLoading, $currentConversationId, handleRegenerate, renderMarkdown*/
       107) {
         each_value = ensure_array_like(
           /*messages*/
@@ -75253,39 +76049,63 @@ function create_fragment$4(ctx) {
         detach(div1);
       }
       destroy_each(each_blocks, detaching);
-      ctx[8](null);
+      ctx[9](null);
       mounted = false;
       dispose();
     }
   };
 }
+function normalizeLatexDelimiters(text2) {
+  if (!text2) return "";
+  return text2.replace(/\\\[([\s\S]*?)\\\]/g, (_, math2) => `
+$$
+${math2.trim()}
+$$
+`).replace(/\\\(([\s\S]*?)\\\)/g, (_, math2) => `$${math2.trim()}$`);
+}
 function instance$4($$self, $$props, $$invalidate) {
   let $currentConversationId;
   component_subscribe($$self, currentConversationId, ($$value) => $$invalidate(3, $currentConversationId = $$value));
-  const dispatch = createEventDispatcher();
+  const dispatch2 = createEventDispatcher();
   let { messages = [] } = $$props;
   let { isLoading = false } = $$props;
+  let { debugMode = false } = $$props;
   let scrollContainer;
   let autoScroll = true;
-  function scrollToBottom() {
-    if (scrollContainer && autoScroll) {
-      scrollContainer.scrollTo({
-        top: scrollContainer.scrollHeight,
-        behavior: "auto"
-      });
-    }
-  }
-  afterUpdate(() => {
-    if (isLoading) {
-      scrollToBottom();
-    }
-  });
   function handleScroll() {
     if (!scrollContainer) return;
     const { scrollTop, scrollHeight, clientHeight } = scrollContainer;
-    const atBottom = scrollHeight - scrollTop <= clientHeight + 100;
-    autoScroll = atBottom;
+    autoScroll = scrollHeight - scrollTop - clientHeight < 50;
   }
+  afterUpdate(() => {
+    if (autoScroll && scrollContainer) {
+      $$invalidate(2, scrollContainer.scrollTop = scrollContainer.scrollHeight, scrollContainer);
+    }
+  });
+  onMount(() => {
+    if (scrollContainer) {
+      $$invalidate(2, scrollContainer.scrollTop = scrollContainer.scrollHeight, scrollContainer);
+    }
+  });
+  marked.use(markedKatex({ throwOnError: false }));
+  marked.use({
+    extensions: [
+      {
+        name: "inlineKatex",
+        renderer(token) {
+          const html2 = katex.renderToString(token.text, { displayMode: false });
+          return `<span class="katex-wrapper" data-latex="$${token.text}$">${html2}</span>`;
+        }
+      },
+      {
+        name: "blockKatex",
+        renderer(token) {
+          const html2 = katex.renderToString(token.text, { displayMode: true });
+          return `<div class="katex-wrapper" data-latex="$$${token.text}$$">${html2}</div>`;
+        }
+      }
+    ]
+  });
   marked.use(markedHighlight({
     langPrefix: "hljs language-",
     highlight(code, lang) {
@@ -75293,26 +76113,14 @@ function instance$4($$self, $$props, $$invalidate) {
       return HighlightJS.highlight(code, { language }).value;
     }
   }));
-  function renderMarkdown(content, isLastAssistant) {
-    if (!content) return isLastAssistant ? "..." : "";
+  function renderMarkdown(content) {
+    if (!content) return "";
     try {
-      let processed = content.replace(/\$\$([\s\S]+?)\$\$/g, (match, tex) => {
-        try {
-          const html2 = katex.renderToString(tex, { displayMode: true, throwOnError: false });
-          return `<div class="katex-wrapper" data-latex="$$${tex}$$">${html2}</div>`;
-        } catch (e) {
-          return match;
-        }
-      });
-      processed = processed.replace(new RegExp("(?<!\\$)\\$([^\\$\\n]+?)\\$(?!\\$)", "g"), (match, tex) => {
-        try {
-          const html2 = katex.renderToString(tex, { displayMode: false, throwOnError: false });
-          return `<span class="katex-wrapper" data-latex="$${tex}$">${html2}</span>`;
-        } catch (e) {
-          return match;
-        }
-      });
-      const rawHtml = marked.parse(processed, { async: false });
+      if (debugMode) {
+        console.log("[RAW LLM OUTPUT]", content);
+      }
+      const normalized = normalizeLatexDelimiters(content);
+      const rawHtml = marked.parse(normalized, { async: false });
       return purify.sanitize(rawHtml, {
         USE_PROFILES: { html: true },
         ADD_TAGS: [
@@ -75370,12 +76178,11 @@ function instance$4($$self, $$props, $$invalidate) {
         FORBID_TAGS: ["script", "iframe", "object"]
       });
     } catch (e) {
-      console.error("Markdown parsing error:", e);
       return content;
     }
   }
   function handleRegenerate() {
-    dispatch("regenerate");
+    dispatch2("regenerate");
   }
   const click_handler = (index) => $currentConversationId && deleteMessage($currentConversationId, index);
   function div1_binding($$value) {
@@ -75387,6 +76194,7 @@ function instance$4($$self, $$props, $$invalidate) {
   $$self.$$set = ($$props2) => {
     if ("messages" in $$props2) $$invalidate(0, messages = $$props2.messages);
     if ("isLoading" in $$props2) $$invalidate(1, isLoading = $$props2.isLoading);
+    if ("debugMode" in $$props2) $$invalidate(7, debugMode = $$props2.debugMode);
   };
   return [
     messages,
@@ -75396,6 +76204,7 @@ function instance$4($$self, $$props, $$invalidate) {
     handleScroll,
     renderMarkdown,
     handleRegenerate,
+    debugMode,
     click_handler,
     div1_binding
   ];
@@ -75403,33 +76212,33 @@ function instance$4($$self, $$props, $$invalidate) {
 class MessageList extends SvelteComponent {
   constructor(options) {
     super();
-    init(this, options, instance$4, create_fragment$4, safe_not_equal, { messages: 0, isLoading: 1 });
+    init(this, options, instance$4, create_fragment$4, safe_not_equal, { messages: 0, isLoading: 1, debugMode: 7 });
   }
 }
 function get_each_context$2(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[30] = list2[i];
-  child_ctx[32] = i;
+  child_ctx[32] = list2[i];
+  child_ctx[34] = i;
   return child_ctx;
 }
 function get_each_context_1$1(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[33] = list2[i];
+  child_ctx[35] = list2[i];
   return child_ctx;
 }
 function get_each_context_2$1(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[36] = list2[i];
-  child_ctx[32] = i;
+  child_ctx[38] = list2[i];
+  child_ctx[34] = i;
   return child_ctx;
 }
 function get_each_context_3(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[36] = list2[i];
-  child_ctx[32] = i;
+  child_ctx[38] = list2[i];
+  child_ctx[34] = i;
   return child_ctx;
 }
-function create_if_block_1$2(ctx) {
+function create_if_block_2$2(ctx) {
   let div2;
   let div0;
   let search;
@@ -75439,14 +76248,16 @@ function create_if_block_1$2(ctx) {
   let div1;
   let t3;
   let current;
-  search = new Search({ props: { size: 12 } });
+  search = new Search({
+    props: { size: 12, class: "text-blue-500" }
+  });
   let if_block0 = (
     /*openedNotes*/
-    ctx[1].length > 0 && create_if_block_3$2(ctx)
+    ctx[3].length > 0 && create_if_block_4$1(ctx)
   );
   let if_block1 = (
     /*suggestions*/
-    ctx[0].length > 0 && create_if_block_2$2(ctx)
+    ctx[2].length > 0 && create_if_block_3$2(ctx)
   );
   return {
     c() {
@@ -75461,9 +76272,9 @@ function create_if_block_1$2(ctx) {
       if (if_block0) if_block0.c();
       t3 = space();
       if (if_block1) if_block1.c();
-      attr(div0, "class", "px-4 py-2 border-b border-gray-50 dark:border-gray-800 flex items-center gap-2 text-xs font-semibold text-gray-500 uppercase tracking-wider bg-gray-50/50 dark:bg-gray-850/50");
-      attr(div1, "class", "overflow-y-auto flex flex-col py-1");
-      attr(div2, "class", "absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-2xl shadow-xl z-10 overflow-hidden flex flex-col max-h-[400px]");
+      attr(div0, "class", "px-6 py-3 border-b border-gray-100 dark:border-gray-800 flex items-center gap-2 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest");
+      attr(div1, "class", "overflow-y-auto flex flex-col py-2 custom-scrollbar");
+      attr(div2, "class", "absolute bottom-full left-0 right-0 mb-4 glass-effect-strong rounded-2xl z-50 overflow-hidden flex flex-col max-h-[400px] animate-in fade-in slide-in-from-bottom-4 duration-300");
     },
     m(target, anchor) {
       insert(target, div2, anchor);
@@ -75481,16 +76292,16 @@ function create_if_block_1$2(ctx) {
     p(ctx2, dirty) {
       if (
         /*openedNotes*/
-        ctx2[1].length > 0
+        ctx2[3].length > 0
       ) {
         if (if_block0) {
           if_block0.p(ctx2, dirty);
           if (dirty[0] & /*openedNotes*/
-          2) {
+          8) {
             transition_in(if_block0, 1);
           }
         } else {
-          if_block0 = create_if_block_3$2(ctx2);
+          if_block0 = create_if_block_4$1(ctx2);
           if_block0.c();
           transition_in(if_block0, 1);
           if_block0.m(div1, t3);
@@ -75504,16 +76315,16 @@ function create_if_block_1$2(ctx) {
       }
       if (
         /*suggestions*/
-        ctx2[0].length > 0
+        ctx2[2].length > 0
       ) {
         if (if_block1) {
           if_block1.p(ctx2, dirty);
           if (dirty[0] & /*suggestions*/
-          1) {
+          4) {
             transition_in(if_block1, 1);
           }
         } else {
-          if_block1 = create_if_block_2$2(ctx2);
+          if_block1 = create_if_block_3$2(ctx2);
           if_block1.c();
           transition_in(if_block1, 1);
           if_block1.m(div1, null);
@@ -75549,14 +76360,14 @@ function create_if_block_1$2(ctx) {
     }
   };
 }
-function create_if_block_3$2(ctx) {
+function create_if_block_4$1(ctx) {
   let div;
   let t1;
   let each_1_anchor;
   let current;
   let each_value_3 = ensure_array_like(
     /*openedNotes*/
-    ctx[1]
+    ctx[3]
   );
   let each_blocks = [];
   for (let i = 0; i < each_value_3.length; i += 1) {
@@ -75574,7 +76385,7 @@ function create_if_block_3$2(ctx) {
         each_blocks[i].c();
       }
       each_1_anchor = empty();
-      attr(div, "class", "px-4 py-1.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest bg-gray-50/30 dark:bg-gray-850/30");
+      attr(div, "class", "px-6 py-2 text-[10px] font-bold text-blue-500/70 uppercase tracking-widest");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -75589,10 +76400,10 @@ function create_if_block_3$2(ctx) {
     },
     p(ctx2, dirty) {
       if (dirty[0] & /*selectedIndex, selectSuggestion, openedNotes*/
-      4114) {
+      16456) {
         each_value_3 = ensure_array_like(
           /*openedNotes*/
-          ctx2[1]
+          ctx2[3]
         );
         let i;
         for (i = 0; i < each_value_3.length; i += 1) {
@@ -75646,9 +76457,10 @@ function create_each_block_3(ctx) {
   let span;
   let t1_value = (
     /*sug*/
-    ctx[36].title + ""
+    ctx[38].title + ""
   );
   let t1;
+  let span_class_value;
   let t2;
   let button_class_value;
   let current;
@@ -75656,16 +76468,20 @@ function create_each_block_3(ctx) {
   let dispose;
   filetext = new File_text({
     props: {
-      size: 14,
-      class: "text-blue-500 shrink-0"
+      size: 16,
+      class: (
+        /*i*/
+        (ctx[34] === /*selectedIndex*/
+        ctx[6] ? "text-blue-500" : "text-blue-500/70") + " shrink-0"
+      )
     }
   });
   function click_handler() {
     return (
       /*click_handler*/
-      ctx[18](
+      ctx[20](
         /*sug*/
-        ctx[36]
+        ctx[38]
       )
     );
   }
@@ -75678,11 +76494,13 @@ function create_each_block_3(ctx) {
       span = element("span");
       t1 = text$3(t1_value);
       t2 = space();
-      attr(span, "class", "text-sm text-gray-800 dark:text-gray-200 truncate font-medium");
-      attr(div, "class", "flex items-center gap-2");
-      attr(button, "class", button_class_value = "w-full px-4 py-2 flex flex-col text-left transition-colors " + /*i*/
-      (ctx[32] === /*selectedIndex*/
-      ctx[4] ? "bg-gray-100 dark:bg-gray-800" : "hover:bg-gray-50 dark:hover:bg-gray-850"));
+      attr(span, "class", span_class_value = "text-sm truncate " + /*i*/
+      (ctx[34] === /*selectedIndex*/
+      ctx[6] ? "text-blue-600 font-medium" : ""));
+      attr(div, "class", "flex items-center gap-3");
+      attr(button, "class", button_class_value = "w-full px-6 py-3 flex flex-col text-left transition-all " + /*i*/
+      (ctx[34] === /*selectedIndex*/
+      ctx[6] ? "bg-blue-500/10 rounded-xl" : "hover:bg-gray-100 dark:hover:bg-gray-800"));
     },
     m(target, anchor) {
       insert(target, button, anchor);
@@ -75700,13 +76518,25 @@ function create_each_block_3(ctx) {
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
+      const filetext_changes = {};
+      if (dirty[0] & /*selectedIndex*/
+      64) filetext_changes.class = /*i*/
+      (ctx[34] === /*selectedIndex*/
+      ctx[6] ? "text-blue-500" : "text-blue-500/70") + " shrink-0";
+      filetext.$set(filetext_changes);
       if ((!current || dirty[0] & /*openedNotes*/
-      2) && t1_value !== (t1_value = /*sug*/
-      ctx[36].title + "")) set_data(t1, t1_value);
+      8) && t1_value !== (t1_value = /*sug*/
+      ctx[38].title + "")) set_data(t1, t1_value);
       if (!current || dirty[0] & /*selectedIndex*/
-      16 && button_class_value !== (button_class_value = "w-full px-4 py-2 flex flex-col text-left transition-colors " + /*i*/
-      (ctx[32] === /*selectedIndex*/
-      ctx[4] ? "bg-gray-100 dark:bg-gray-800" : "hover:bg-gray-50 dark:hover:bg-gray-850"))) {
+      64 && span_class_value !== (span_class_value = "text-sm truncate " + /*i*/
+      (ctx[34] === /*selectedIndex*/
+      ctx[6] ? "text-blue-600 font-medium" : ""))) {
+        attr(span, "class", span_class_value);
+      }
+      if (!current || dirty[0] & /*selectedIndex*/
+      64 && button_class_value !== (button_class_value = "w-full px-6 py-3 flex flex-col text-left transition-all " + /*i*/
+      (ctx[34] === /*selectedIndex*/
+      ctx[6] ? "bg-blue-500/10 rounded-xl" : "hover:bg-gray-100 dark:hover:bg-gray-800"))) {
         attr(button, "class", button_class_value);
       }
     },
@@ -75729,7 +76559,7 @@ function create_each_block_3(ctx) {
     }
   };
 }
-function create_if_block_2$2(ctx) {
+function create_if_block_3$2(ctx) {
   let div;
   let t0;
   let div_class_value;
@@ -75738,7 +76568,7 @@ function create_if_block_2$2(ctx) {
   let current;
   let each_value_2 = ensure_array_like(
     /*suggestions*/
-    ctx[0]
+    ctx[2]
   );
   let each_blocks = [];
   for (let i = 0; i < each_value_2.length; i += 1) {
@@ -75756,8 +76586,8 @@ function create_if_block_2$2(ctx) {
         each_blocks[i].c();
       }
       each_1_anchor = empty();
-      attr(div, "class", div_class_value = "px-4 py-1.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest bg-gray-50/30 dark:bg-gray-850/30 " + /*openedNotes*/
-      (ctx[1].length > 0 ? "mt-2 border-t border-gray-50 dark:border-gray-800" : ""));
+      attr(div, "class", div_class_value = "px-6 py-2 text-[10px] font-bold text-purple-500/70 uppercase tracking-widest " + /*openedNotes*/
+      (ctx[3].length > 0 ? "mt-4 border-t border-gray-100 dark:border-gray-800 pt-4" : ""));
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -75773,15 +76603,15 @@ function create_if_block_2$2(ctx) {
     },
     p(ctx2, dirty) {
       if (!current || dirty[0] & /*openedNotes*/
-      2 && div_class_value !== (div_class_value = "px-4 py-1.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest bg-gray-50/30 dark:bg-gray-850/30 " + /*openedNotes*/
-      (ctx2[1].length > 0 ? "mt-2 border-t border-gray-50 dark:border-gray-800" : ""))) {
+      8 && div_class_value !== (div_class_value = "px-6 py-2 text-[10px] font-bold text-purple-500/70 uppercase tracking-widest " + /*openedNotes*/
+      (ctx2[3].length > 0 ? "mt-4 border-t border-gray-100 dark:border-gray-800 pt-4" : ""))) {
         attr(div, "class", div_class_value);
       }
       if (dirty[0] & /*openedNotes, selectedIndex, selectSuggestion, suggestions*/
-      4115) {
+      16460) {
         each_value_2 = ensure_array_like(
           /*suggestions*/
-          ctx2[0]
+          ctx2[2]
         );
         let i;
         for (i = 0; i < each_value_2.length; i += 1) {
@@ -75835,8 +76665,9 @@ function create_each_block_2$1(ctx) {
   let span;
   let raw_value = (
     /*sug*/
-    ctx[36].content + ""
+    ctx[38].content + ""
   );
+  let span_class_value;
   let t1;
   let button_class_value;
   let current;
@@ -75844,16 +76675,21 @@ function create_each_block_2$1(ctx) {
   let dispose;
   filetext = new File_text({
     props: {
-      size: 14,
-      class: "text-gray-400 shrink-0"
+      size: 16,
+      class: (
+        /*i*/
+        (ctx[34] + /*openedNotes*/
+        ctx[3].length === /*selectedIndex*/
+        ctx[6] ? "text-purple-500" : "text-purple-500/70") + " shrink-0"
+      )
     }
   });
   function click_handler_1() {
     return (
       /*click_handler_1*/
-      ctx[19](
+      ctx[21](
         /*sug*/
-        ctx[36]
+        ctx[38]
       )
     );
   }
@@ -75865,12 +76701,15 @@ function create_each_block_2$1(ctx) {
       t0 = space();
       span = element("span");
       t1 = space();
-      attr(span, "class", "text-sm text-gray-800 dark:text-gray-200 truncate font-medium");
-      attr(div, "class", "flex items-center gap-2");
-      attr(button, "class", button_class_value = "w-full px-4 py-2 flex flex-col text-left transition-colors " + /*i*/
-      (ctx[32] + /*openedNotes*/
-      ctx[1].length === /*selectedIndex*/
-      ctx[4] ? "bg-gray-100 dark:bg-gray-800" : "hover:bg-gray-50 dark:hover:bg-gray-800"));
+      attr(span, "class", span_class_value = "text-sm truncate " + /*i*/
+      (ctx[34] + /*openedNotes*/
+      ctx[3].length === /*selectedIndex*/
+      ctx[6] ? "text-purple-600 font-medium" : ""));
+      attr(div, "class", "flex items-center gap-3");
+      attr(button, "class", button_class_value = "w-full px-6 py-3 flex flex-col text-left transition-all " + /*i*/
+      (ctx[34] + /*openedNotes*/
+      ctx[3].length === /*selectedIndex*/
+      ctx[6] ? "bg-purple-500/10 rounded-xl" : "hover:bg-gray-100 dark:hover:bg-gray-800"));
     },
     m(target, anchor) {
       insert(target, button, anchor);
@@ -75888,14 +76727,28 @@ function create_each_block_2$1(ctx) {
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
+      const filetext_changes = {};
+      if (dirty[0] & /*openedNotes, selectedIndex*/
+      72) filetext_changes.class = /*i*/
+      (ctx[34] + /*openedNotes*/
+      ctx[3].length === /*selectedIndex*/
+      ctx[6] ? "text-purple-500" : "text-purple-500/70") + " shrink-0";
+      filetext.$set(filetext_changes);
       if ((!current || dirty[0] & /*suggestions*/
-      1) && raw_value !== (raw_value = /*sug*/
-      ctx[36].content + "")) span.innerHTML = raw_value;
+      4) && raw_value !== (raw_value = /*sug*/
+      ctx[38].content + "")) span.innerHTML = raw_value;
       if (!current || dirty[0] & /*openedNotes, selectedIndex*/
-      18 && button_class_value !== (button_class_value = "w-full px-4 py-2 flex flex-col text-left transition-colors " + /*i*/
-      (ctx[32] + /*openedNotes*/
-      ctx[1].length === /*selectedIndex*/
-      ctx[4] ? "bg-gray-100 dark:bg-gray-800" : "hover:bg-gray-50 dark:hover:bg-gray-800"))) {
+      72 && span_class_value !== (span_class_value = "text-sm truncate " + /*i*/
+      (ctx[34] + /*openedNotes*/
+      ctx[3].length === /*selectedIndex*/
+      ctx[6] ? "text-purple-600 font-medium" : ""))) {
+        attr(span, "class", span_class_value);
+      }
+      if (!current || dirty[0] & /*openedNotes, selectedIndex*/
+      72 && button_class_value !== (button_class_value = "w-full px-6 py-3 flex flex-col text-left transition-all " + /*i*/
+      (ctx[34] + /*openedNotes*/
+      ctx[3].length === /*selectedIndex*/
+      ctx[6] ? "bg-purple-500/10 rounded-xl" : "hover:bg-gray-100 dark:hover:bg-gray-800"))) {
         attr(button, "class", button_class_value);
       }
     },
@@ -75918,13 +76771,23 @@ function create_each_block_2$1(ctx) {
     }
   };
 }
-function create_if_block$3(ctx) {
+function create_else_block_1$2(ctx) {
+  return {
+    c: noop,
+    m: noop,
+    p: noop,
+    i: noop,
+    o: noop,
+    d: noop
+  };
+}
+function create_if_block_1$2(ctx) {
   let div;
   let t;
   let current;
   let each_value_1 = ensure_array_like(
     /*selectedReferences*/
-    ctx[5]
+    ctx[7]
   );
   let each_blocks_1 = [];
   for (let i = 0; i < each_value_1.length; i += 1) {
@@ -75935,7 +76798,7 @@ function create_if_block$3(ctx) {
   });
   let each_value = ensure_array_like(
     /*selectedImages*/
-    ctx[6]
+    ctx[8]
   );
   let each_blocks = [];
   for (let i = 0; i < each_value.length; i += 1) {
@@ -75954,7 +76817,7 @@ function create_if_block$3(ctx) {
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
-      attr(div, "class", "mx-3 mt-3 pb-1.5 flex items-center flex-wrap gap-2");
+      attr(div, "class", "mx-4 mt-4 pb-2 flex items-center flex-wrap gap-3");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -75973,10 +76836,10 @@ function create_if_block$3(ctx) {
     },
     p(ctx2, dirty) {
       if (dirty[0] & /*removeReference, selectedReferences*/
-      8224) {
+      32896) {
         each_value_1 = ensure_array_like(
           /*selectedReferences*/
-          ctx2[5]
+          ctx2[7]
         );
         let i;
         for (i = 0; i < each_value_1.length; i += 1) {
@@ -75998,10 +76861,10 @@ function create_if_block$3(ctx) {
         check_outros();
       }
       if (dirty[0] & /*removeImage, selectedImages*/
-      2112) {
+      8448) {
         each_value = ensure_array_like(
           /*selectedImages*/
-          ctx2[6]
+          ctx2[8]
         );
         let i;
         for (i = 0; i < each_value.length; i += 1) {
@@ -76054,7 +76917,6 @@ function create_if_block$3(ctx) {
   };
 }
 function create_each_block_1$1(ctx) {
-  let div4;
   let div1;
   let div0;
   let filetext;
@@ -76062,13 +76924,11 @@ function create_each_block_1$1(ctx) {
   let span;
   let t1_value = (
     /*ref*/
-    ctx[33].title + ""
+    ctx[35].title + ""
   );
   let t1;
   let t2;
-  let div3;
   let button;
-  let div2;
   let x;
   let current;
   let mounted;
@@ -76076,22 +76936,21 @@ function create_each_block_1$1(ctx) {
   filetext = new File_text({
     props: {
       size: 14,
-      class: "text-gray-500 shrink-0"
+      class: "text-blue-500 shrink-0"
     }
   });
-  x = new X({ props: { size: 12, strokeWidth: 2.5 } });
+  x = new X({ props: { size: 10, strokeWidth: 4 } });
   function click_handler_2() {
     return (
       /*click_handler_2*/
-      ctx[20](
+      ctx[22](
         /*ref*/
-        ctx[33]
+        ctx[35]
       )
     );
   }
   return {
     c() {
-      div4 = element("div");
       div1 = element("div");
       div0 = element("div");
       create_component(filetext.$$.fragment);
@@ -76099,31 +76958,23 @@ function create_each_block_1$1(ctx) {
       span = element("span");
       t1 = text$3(t1_value);
       t2 = space();
-      div3 = element("div");
       button = element("button");
-      div2 = element("div");
       create_component(x.$$.fragment);
-      attr(span, "class", "text-xs font-medium truncate text-gray-700 dark:text-gray-300");
-      attr(div0, "class", "flex items-center gap-2 overflow-hidden");
-      attr(div1, "class", "flex items-center justify-center p-3 bg-gray-100 dark:bg-gray-800 rounded-xl max-w-[200px] border border-gray-200 dark:border-gray-700");
-      attr(div2, "class", "p-1");
-      attr(button, "class", "bg-white text-black border border-white rounded-full transition hover:scale-110 shadow-sm cursor-pointer");
-      attr(div3, "class", "absolute -top-2 -right-2");
-      attr(div4, "class", "relative group");
+      attr(span, "class", "text-xs font-bold truncate text-blue-700 dark:text-blue-300");
+      attr(div0, "class", "flex items-center gap-2 px-4 py-2 bg-blue-500/10 border border-blue-500/20 rounded-xl max-w-[220px]");
+      attr(button, "class", "absolute -top-2 -right-2 bg-white dark:bg-gray-800 text-red-500 border border-red-500/20 rounded-full p-1 shadow-lg hover:scale-125 transition-all cursor-pointer");
+      attr(div1, "class", "relative group animate-in zoom-in duration-300");
     },
     m(target, anchor) {
-      insert(target, div4, anchor);
-      append(div4, div1);
+      insert(target, div1, anchor);
       append(div1, div0);
       mount_component(filetext, div0, null);
       append(div0, t0);
       append(div0, span);
       append(span, t1);
-      append(div4, t2);
-      append(div4, div3);
-      append(div3, button);
-      append(button, div2);
-      mount_component(x, div2, null);
+      append(div1, t2);
+      append(div1, button);
+      mount_component(x, button, null);
       current = true;
       if (!mounted) {
         dispose = listen(button, "click", click_handler_2);
@@ -76133,8 +76984,8 @@ function create_each_block_1$1(ctx) {
     p(new_ctx, dirty) {
       ctx = new_ctx;
       if ((!current || dirty[0] & /*selectedReferences*/
-      32) && t1_value !== (t1_value = /*ref*/
-      ctx[33].title + "")) set_data(t1, t1_value);
+      128) && t1_value !== (t1_value = /*ref*/
+      ctx[35].title + "")) set_data(t1, t1_value);
     },
     i(local) {
       if (current) return;
@@ -76149,7 +77000,7 @@ function create_each_block_1$1(ctx) {
     },
     d(detaching) {
       if (detaching) {
-        detach(div4);
+        detach(div1);
       }
       destroy_component(filetext);
       destroy_component(x);
@@ -76159,60 +77010,52 @@ function create_each_block_1$1(ctx) {
   };
 }
 function create_each_block$2(ctx) {
-  let div3;
+  let div1;
   let div0;
   let img_1;
   let img_1_src_value;
   let t0;
-  let div2;
   let button;
-  let div1;
   let x;
   let t1;
   let current;
   let mounted;
   let dispose;
-  x = new X({ props: { size: 12, strokeWidth: 2.5 } });
+  x = new X({ props: { size: 10, strokeWidth: 4 } });
   function click_handler_3() {
     return (
       /*click_handler_3*/
-      ctx[21](
+      ctx[23](
         /*i*/
-        ctx[32]
+        ctx[34]
       )
     );
   }
   return {
     c() {
-      div3 = element("div");
+      div1 = element("div");
       div0 = element("div");
       img_1 = element("img");
       t0 = space();
-      div2 = element("div");
       button = element("button");
-      div1 = element("div");
       create_component(x.$$.fragment);
       t1 = space();
       if (!src_url_equal(img_1.src, img_1_src_value = /*img*/
-      ctx[30])) attr(img_1, "src", img_1_src_value);
+      ctx[32])) attr(img_1, "src", img_1_src_value);
       attr(img_1, "alt", "Preview");
       attr(img_1, "class", "w-full h-full object-cover");
-      attr(div0, "class", "size-16 rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700");
-      attr(div1, "class", "p-1");
-      attr(button, "class", "bg-white text-black border border-white rounded-full transition hover:scale-110 shadow-sm cursor-pointer");
-      attr(div2, "class", "absolute -top-2 -right-2");
-      attr(div3, "class", "relative group");
+      attr(div0, "class", "size-20 rounded-xl overflow-hidden border-2 border-purple-500/20 shadow-lg");
+      attr(button, "class", "absolute -top-2 -right-2 bg-white dark:bg-gray-800 text-red-500 border border-red-500/20 rounded-full p-1 shadow-lg hover:scale-125 transition-all cursor-pointer");
+      attr(div1, "class", "relative group animate-in zoom-in duration-300");
     },
     m(target, anchor) {
-      insert(target, div3, anchor);
-      append(div3, div0);
+      insert(target, div1, anchor);
+      append(div1, div0);
       append(div0, img_1);
-      append(div3, t0);
-      append(div3, div2);
-      append(div2, button);
-      append(button, div1);
-      mount_component(x, div1, null);
-      append(div3, t1);
+      append(div1, t0);
+      append(div1, button);
+      mount_component(x, button, null);
+      append(div1, t1);
       current = true;
       if (!mounted) {
         dispose = listen(button, "click", click_handler_3);
@@ -76222,8 +77065,8 @@ function create_each_block$2(ctx) {
     p(new_ctx, dirty) {
       ctx = new_ctx;
       if (!current || dirty[0] & /*selectedImages*/
-      64 && !src_url_equal(img_1.src, img_1_src_value = /*img*/
-      ctx[30])) {
+      256 && !src_url_equal(img_1.src, img_1_src_value = /*img*/
+      ctx[32])) {
         attr(img_1, "src", img_1_src_value);
       }
     },
@@ -76238,9 +77081,138 @@ function create_each_block$2(ctx) {
     },
     d(detaching) {
       if (detaching) {
-        detach(div3);
+        detach(div1);
       }
       destroy_component(x);
+      mounted = false;
+      dispose();
+    }
+  };
+}
+function create_else_block$2(ctx) {
+  let button;
+  let send_1;
+  let button_disabled_value;
+  let current;
+  let mounted;
+  let dispose;
+  send_1 = new Send({
+    props: {
+      size: 18,
+      strokeWidth: 2.5,
+      class: (
+        /*value*/
+        ctx[4].trim() ? "animate-pulse" : ""
+      )
+    }
+  });
+  return {
+    c() {
+      button = element("button");
+      create_component(send_1.$$.fragment);
+      attr(button, "class", "absolute right-4 shrink-0 flex items-center justify-center w-10 h-10 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 text-white transition-all hover:scale-110 active:scale-90 shadow-lg disabled:opacity-20 disabled:grayscale disabled:hover:scale-100 disabled:cursor-not-allowed cursor-pointer z-10");
+      set_style(button, "top", "50%");
+      set_style(button, "margin-top", "-20px");
+      button.disabled = button_disabled_value = !/*value*/
+      ctx[4].trim() && /*selectedReferences*/
+      ctx[7].length === 0 && /*selectedImages*/
+      ctx[8].length === 0;
+    },
+    m(target, anchor) {
+      insert(target, button, anchor);
+      mount_component(send_1, button, null);
+      current = true;
+      if (!mounted) {
+        dispose = listen(
+          button,
+          "click",
+          /*send*/
+          ctx[17]
+        );
+        mounted = true;
+      }
+    },
+    p(ctx2, dirty) {
+      const send_1_changes = {};
+      if (dirty[0] & /*value*/
+      16) send_1_changes.class = /*value*/
+      ctx2[4].trim() ? "animate-pulse" : "";
+      send_1.$set(send_1_changes);
+      if (!current || dirty[0] & /*value, selectedReferences, selectedImages*/
+      400 && button_disabled_value !== (button_disabled_value = !/*value*/
+      ctx2[4].trim() && /*selectedReferences*/
+      ctx2[7].length === 0 && /*selectedImages*/
+      ctx2[8].length === 0)) {
+        button.disabled = button_disabled_value;
+      }
+    },
+    i(local) {
+      if (current) return;
+      transition_in(send_1.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(send_1.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(button);
+      }
+      destroy_component(send_1);
+      mounted = false;
+      dispose();
+    }
+  };
+}
+function create_if_block$3(ctx) {
+  let button;
+  let square;
+  let current;
+  let mounted;
+  let dispose;
+  square = new Square({
+    props: { size: 16, fill: "currentColor" }
+  });
+  return {
+    c() {
+      button = element("button");
+      create_component(square.$$.fragment);
+      attr(button, "class", "absolute right-4 shrink-0 flex items-center justify-center w-10 h-10 rounded-full bg-red-500 text-white transition-all hover:scale-110 active:scale-90 shadow-lg cursor-pointer z-10 animate-in fade-in zoom-in duration-200");
+      set_style(button, "top", "50%");
+      set_style(button, "margin-top", "-20px");
+    },
+    m(target, anchor) {
+      insert(target, button, anchor);
+      mount_component(square, button, null);
+      current = true;
+      if (!mounted) {
+        dispose = listen(button, "click", function() {
+          if (is_function(
+            /*onStop*/
+            ctx[1]
+          )) ctx[1].apply(this, arguments);
+        });
+        mounted = true;
+      }
+    },
+    p(new_ctx, dirty) {
+      ctx = new_ctx;
+    },
+    i(local) {
+      if (current) return;
+      transition_in(square.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(square.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      if (detaching) {
+        detach(button);
+      }
+      destroy_component(square);
       mounted = false;
       dispose();
     }
@@ -76251,30 +77223,48 @@ function create_fragment$3(ctx) {
   let div2;
   let t0;
   let div1;
+  let current_block_type_index;
+  let if_block1;
   let t1;
   let div0;
-  let button0;
+  let button;
   let plus;
   let t2;
   let textarea;
   let t3;
-  let button1;
-  let send_1;
-  let button1_disabled_value;
+  let current_block_type_index_1;
+  let if_block2;
   let current;
   let mounted;
   let dispose;
   let if_block0 = (
     /*showSuggestions*/
-    ctx[3] && create_if_block_1$2(ctx)
+    ctx[5] && create_if_block_2$2(ctx)
   );
-  let if_block1 = (
-    /*selectedReferences*/
-    (ctx[5].length > 0 || /*selectedImages*/
-    ctx[6].length > 0) && create_if_block$3(ctx)
-  );
-  plus = new Plus({ props: { size: 14, strokeWidth: 3 } });
-  send_1 = new Send({ props: { size: 16, strokeWidth: 2.5 } });
+  const if_block_creators = [create_if_block_1$2, create_else_block_1$2];
+  const if_blocks = [];
+  function select_block_type(ctx2, dirty) {
+    if (
+      /*selectedReferences*/
+      ctx2[7].length > 0 || /*selectedImages*/
+      ctx2[8].length > 0
+    ) return 0;
+    return 1;
+  }
+  current_block_type_index = select_block_type(ctx);
+  if_block1 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
+  plus = new Plus({ props: { size: 18, strokeWidth: 3 } });
+  const if_block_creators_1 = [create_if_block$3, create_else_block$2];
+  const if_blocks_1 = [];
+  function select_block_type_1(ctx2, dirty) {
+    if (
+      /*isLoading*/
+      ctx2[0]
+    ) return 0;
+    return 1;
+  }
+  current_block_type_index_1 = select_block_type_1(ctx);
+  if_block2 = if_blocks_1[current_block_type_index_1] = if_block_creators_1[current_block_type_index_1](ctx);
   return {
     c() {
       div3 = element("div");
@@ -76282,30 +77272,26 @@ function create_fragment$3(ctx) {
       if (if_block0) if_block0.c();
       t0 = space();
       div1 = element("div");
-      if (if_block1) if_block1.c();
+      if_block1.c();
       t1 = space();
       div0 = element("div");
-      button0 = element("button");
+      button = element("button");
       create_component(plus.$$.fragment);
       t2 = space();
       textarea = element("textarea");
       t3 = space();
-      button1 = element("button");
-      create_component(send_1.$$.fragment);
-      attr(button0, "class", "absolute top-3 left-3 shrink-0 p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition-all cursor-pointer flex items-center justify-center border border-gray-200/50 dark:border-gray-700/50 z-10");
-      attr(button0, "title", "Attach note (Type @)");
-      attr(textarea, "placeholder", "@ to reference notes");
-      attr(textarea, "class", "scrollbar-hidden bg-transparent dark:text-gray-100 outline-none w-full resize-none h-[60px] max-h-60 overflow-auto text-[14px] leading-relaxed placeholder-gray-400/80 pl-12 pr-12 py-4");
-      attr(button1, "class", "absolute top-3 right-3 shrink-0 flex items-center justify-center w-8 h-8 rounded-lg bg-black text-white dark:bg-white dark:text-black transition-all hover:scale-105 active:scale-95 disabled:opacity-30 disabled:hover:scale-100 disabled:cursor-not-allowed cursor-pointer z-10");
-      button1.disabled = button1_disabled_value = !/*value*/
-      ctx[2].trim() && /*selectedReferences*/
-      ctx[5].length === 0 && /*selectedImages*/
-      ctx[6].length === 0;
-      attr(div0, "class", "relative flex flex-col min-h-[60px]");
+      if_block2.c();
+      attr(button, "class", "absolute left-4 shrink-0 w-10 h-10 rounded-full text-blue-500 hover:bg-blue-500/10 transition-all cursor-pointer flex items-center justify-center border border-blue-500/10 z-10 hover:scale-110 active:scale-90");
+      set_style(button, "top", "50%");
+      set_style(button, "margin-top", "-20px");
+      attr(button, "title", "Attach note (Type @)");
+      attr(textarea, "placeholder", "Type @ to reference your notes...");
+      attr(textarea, "class", "scrollbar-hidden bg-transparent text-gray-950 dark:text-gray-50 outline-none w-full resize-none h-[72px] max-h-80 overflow-auto text-base leading-relaxed placeholder-gray-400 dark:placeholder-gray-500 pl-16 pr-16 py-6 font-normal");
+      attr(div0, "class", "relative flex flex-col min-h-[72px]");
       attr(div1, "id", "message-input-container");
-      attr(div1, "class", "flex flex-col relative w-full shadow-sm rounded-xl border border-gray-200/50 dark:border-gray-800/50 hover:border-gray-300 focus-within:border-gray-300 hover:dark:border-gray-700 focus-within:dark:border-gray-700 transition bg-white dark:bg-gray-850 dark:text-gray-100");
-      attr(div2, "class", "w-full flex flex-col gap-1.5 relative");
-      attr(div3, "class", "px-8 mx-auto inset-x-0 w-full max-w-3xl font-primary mb-2");
+      attr(div1, "class", "overflow-hidden flex flex-col transition-all duration-500 group rounded-3xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 shadow-xl shadow-gray-300/50 dark:shadow-black/30");
+      attr(div2, "class", "w-full flex flex-col gap-2 relative");
+      attr(div3, "class", "px-2 mx-auto inset-x-0 w-full max-w-4xl font-primary mb-2");
     },
     m(target, anchor) {
       insert(target, div3, anchor);
@@ -76313,66 +77299,59 @@ function create_fragment$3(ctx) {
       if (if_block0) if_block0.m(div2, null);
       append(div2, t0);
       append(div2, div1);
-      if (if_block1) if_block1.m(div1, null);
+      if_blocks[current_block_type_index].m(div1, null);
       append(div1, t1);
       append(div1, div0);
-      append(div0, button0);
-      mount_component(plus, button0, null);
+      append(div0, button);
+      mount_component(plus, button, null);
       append(div0, t2);
       append(div0, textarea);
-      ctx[22](textarea);
+      ctx[24](textarea);
       set_input_value(
         textarea,
         /*value*/
-        ctx[2]
+        ctx[4]
       );
       append(div0, t3);
-      append(div0, button1);
-      mount_component(send_1, button1, null);
+      if_blocks_1[current_block_type_index_1].m(div0, null);
       current = true;
       if (!mounted) {
         dispose = [
           listen(
-            button0,
+            button,
             "click",
             /*handlePlusClick*/
-            ctx[16]
+            ctx[18]
           ),
           listen(
             textarea,
             "input",
             /*textarea_input_handler*/
-            ctx[23]
+            ctx[25]
           ),
           listen(
             textarea,
             "input",
             /*handleInput*/
-            ctx[8]
+            ctx[10]
           ),
           listen(
             textarea,
             "keydown",
             /*handleKeydown*/
-            ctx[14]
+            ctx[16]
           ),
           listen(
             textarea,
             "paste",
             /*handlePaste*/
-            ctx[9]
-          ),
-          listen(
-            button1,
-            "click",
-            /*send*/
-            ctx[15]
+            ctx[11]
           ),
           listen(
             div1,
             "drop",
             /*handleDrop*/
-            ctx[10]
+            ctx[12]
           ),
           listen(div1, "dragover", prevent_default(dragover_handler))
         ];
@@ -76382,16 +77361,16 @@ function create_fragment$3(ctx) {
     p(ctx2, dirty) {
       if (
         /*showSuggestions*/
-        ctx2[3]
+        ctx2[5]
       ) {
         if (if_block0) {
           if_block0.p(ctx2, dirty);
           if (dirty[0] & /*showSuggestions*/
-          8) {
+          32) {
             transition_in(if_block0, 1);
           }
         } else {
-          if_block0 = create_if_block_1$2(ctx2);
+          if_block0 = create_if_block_2$2(ctx2);
           if_block0.c();
           transition_in(if_block0, 1);
           if_block0.m(div2, t0);
@@ -76403,44 +77382,53 @@ function create_fragment$3(ctx) {
         });
         check_outros();
       }
-      if (
-        /*selectedReferences*/
-        ctx2[5].length > 0 || /*selectedImages*/
-        ctx2[6].length > 0
-      ) {
-        if (if_block1) {
-          if_block1.p(ctx2, dirty);
-          if (dirty[0] & /*selectedReferences, selectedImages*/
-          96) {
-            transition_in(if_block1, 1);
-          }
-        } else {
-          if_block1 = create_if_block$3(ctx2);
-          if_block1.c();
-          transition_in(if_block1, 1);
-          if_block1.m(div1, t1);
-        }
-      } else if (if_block1) {
+      let previous_block_index = current_block_type_index;
+      current_block_type_index = select_block_type(ctx2);
+      if (current_block_type_index === previous_block_index) {
+        if_blocks[current_block_type_index].p(ctx2, dirty);
+      } else {
         group_outros();
-        transition_out(if_block1, 1, 1, () => {
-          if_block1 = null;
+        transition_out(if_blocks[previous_block_index], 1, 1, () => {
+          if_blocks[previous_block_index] = null;
         });
         check_outros();
+        if_block1 = if_blocks[current_block_type_index];
+        if (!if_block1) {
+          if_block1 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx2);
+          if_block1.c();
+        } else {
+          if_block1.p(ctx2, dirty);
+        }
+        transition_in(if_block1, 1);
+        if_block1.m(div1, t1);
       }
       if (dirty[0] & /*value*/
-      4) {
+      16) {
         set_input_value(
           textarea,
           /*value*/
-          ctx2[2]
+          ctx2[4]
         );
       }
-      if (!current || dirty[0] & /*value, selectedReferences, selectedImages*/
-      100 && button1_disabled_value !== (button1_disabled_value = !/*value*/
-      ctx2[2].trim() && /*selectedReferences*/
-      ctx2[5].length === 0 && /*selectedImages*/
-      ctx2[6].length === 0)) {
-        button1.disabled = button1_disabled_value;
+      let previous_block_index_1 = current_block_type_index_1;
+      current_block_type_index_1 = select_block_type_1(ctx2);
+      if (current_block_type_index_1 === previous_block_index_1) {
+        if_blocks_1[current_block_type_index_1].p(ctx2, dirty);
+      } else {
+        group_outros();
+        transition_out(if_blocks_1[previous_block_index_1], 1, 1, () => {
+          if_blocks_1[previous_block_index_1] = null;
+        });
+        check_outros();
+        if_block2 = if_blocks_1[current_block_type_index_1];
+        if (!if_block2) {
+          if_block2 = if_blocks_1[current_block_type_index_1] = if_block_creators_1[current_block_type_index_1](ctx2);
+          if_block2.c();
+        } else {
+          if_block2.p(ctx2, dirty);
+        }
+        transition_in(if_block2, 1);
+        if_block2.m(div0, null);
       }
     },
     i(local) {
@@ -76448,14 +77436,14 @@ function create_fragment$3(ctx) {
       transition_in(if_block0);
       transition_in(if_block1);
       transition_in(plus.$$.fragment, local);
-      transition_in(send_1.$$.fragment, local);
+      transition_in(if_block2);
       current = true;
     },
     o(local) {
       transition_out(if_block0);
       transition_out(if_block1);
       transition_out(plus.$$.fragment, local);
-      transition_out(send_1.$$.fragment, local);
+      transition_out(if_block2);
       current = false;
     },
     d(detaching) {
@@ -76463,10 +77451,10 @@ function create_fragment$3(ctx) {
         detach(div3);
       }
       if (if_block0) if_block0.d();
-      if (if_block1) if_block1.d();
+      if_blocks[current_block_type_index].d();
       destroy_component(plus);
-      ctx[22](null);
-      destroy_component(send_1);
+      ctx[24](null);
+      if_blocks_1[current_block_type_index_1].d();
       mounted = false;
       run_all(dispose);
     }
@@ -76500,7 +77488,10 @@ const dragover_handler = () => {
 function instance$3($$self, $$props, $$invalidate) {
   let allSuggestions;
   let { i18n } = $$props;
-  const dispatch = createEventDispatcher();
+  let { isLoading = false } = $$props;
+  let { onStop = () => {
+  } } = $$props;
+  const dispatch2 = createEventDispatcher();
   let value = "";
   let showSuggestions = false;
   let suggestions = [];
@@ -76527,25 +77518,25 @@ function instance$3($$self, $$props, $$invalidate) {
               const opened = getOpenedNotes();
               const searched = await searchBlocks(query);
               if (searchId !== currentSearchId) return;
-              $$invalidate(1, openedNotes = opened.filter((n) => !query || n.title.toLowerCase().includes(query.toLowerCase())));
+              $$invalidate(3, openedNotes = opened.filter((n) => !query || n.title.toLowerCase().includes(query.toLowerCase())));
               const openedIds = new Set(openedNotes.map((n) => n.id));
-              $$invalidate(0, suggestions = searched.filter((s) => !openedIds.has(s.id)));
-              $$invalidate(3, showSuggestions = openedNotes.length + suggestions.length > 0);
-              $$invalidate(4, selectedIndex = 0);
+              $$invalidate(2, suggestions = searched.filter((s) => !openedIds.has(s.id)));
+              $$invalidate(5, showSuggestions = openedNotes.length + suggestions.length > 0);
+              $$invalidate(6, selectedIndex = 0);
             } catch (error2) {
               console.error("Error fetching suggestions:", error2);
-              if (searchId === currentSearchId) $$invalidate(3, showSuggestions = false);
+              if (searchId === currentSearchId) $$invalidate(5, showSuggestions = false);
             }
           },
           150
         );
       } else {
         clearTimeout(searchTimeout);
-        $$invalidate(3, showSuggestions = false);
+        $$invalidate(5, showSuggestions = false);
       }
     } catch (error2) {
       console.error("Error in handleInput:", error2);
-      $$invalidate(3, showSuggestions = false);
+      $$invalidate(5, showSuggestions = false);
     }
     autoGrow();
   }
@@ -76575,29 +77566,29 @@ function instance$3($$self, $$props, $$invalidate) {
       var _a;
       const base64 = (_a = e.target) == null ? void 0 : _a.result;
       if (!selectedImages.includes(base64)) {
-        $$invalidate(6, selectedImages = [...selectedImages, base64]);
+        $$invalidate(8, selectedImages = [...selectedImages, base64]);
       }
     };
     reader.readAsDataURL(file);
   }
   function removeImage(index) {
-    $$invalidate(6, selectedImages = selectedImages.filter((_, i) => i !== index));
+    $$invalidate(8, selectedImages = selectedImages.filter((_, i) => i !== index));
   }
   function autoGrow() {
     if (!inputElement) return;
-    $$invalidate(7, inputElement.style.height = "60px", inputElement);
-    const newHeight = Math.max(60, Math.min(inputElement.scrollHeight, 240));
-    $$invalidate(7, inputElement.style.height = newHeight + "px", inputElement);
+    $$invalidate(9, inputElement.style.height = "72px", inputElement);
+    const newHeight = Math.max(72, Math.min(inputElement.scrollHeight, 320));
+    $$invalidate(9, inputElement.style.height = newHeight + "px", inputElement);
   }
   function selectSuggestion(suggestion) {
     const cursorPosition = inputElement.selectionStart;
     const textBeforeCursor = value.slice(0, cursorPosition);
     const textAfterCursor = value.slice(cursorPosition);
     const lastAt = textBeforeCursor.lastIndexOf("@");
-    $$invalidate(2, value = textBeforeCursor.slice(0, lastAt) + textAfterCursor);
-    $$invalidate(3, showSuggestions = false);
+    $$invalidate(4, value = textBeforeCursor.slice(0, lastAt) + textAfterCursor);
+    $$invalidate(5, showSuggestions = false);
     if (!selectedReferences.find((r) => r.id === suggestion.id)) {
-      $$invalidate(5, selectedReferences = [
+      $$invalidate(7, selectedReferences = [
         ...selectedReferences,
         {
           id: suggestion.id,
@@ -76609,21 +77600,21 @@ function instance$3($$self, $$props, $$invalidate) {
     setTimeout(autoGrow, 0);
   }
   function removeReference(id) {
-    $$invalidate(5, selectedReferences = selectedReferences.filter((r) => r.id !== id));
+    $$invalidate(7, selectedReferences = selectedReferences.filter((r) => r.id !== id));
   }
   function handleKeydown(e) {
     if (showSuggestions) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        $$invalidate(4, selectedIndex = (selectedIndex + 1) % allSuggestions.length);
+        $$invalidate(6, selectedIndex = (selectedIndex + 1) % allSuggestions.length);
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        $$invalidate(4, selectedIndex = (selectedIndex - 1 + allSuggestions.length) % allSuggestions.length);
+        $$invalidate(6, selectedIndex = (selectedIndex - 1 + allSuggestions.length) % allSuggestions.length);
       } else if (e.key === "Enter") {
         e.preventDefault();
         selectSuggestion(allSuggestions[selectedIndex]);
       } else if (e.key === "Escape") {
-        $$invalidate(3, showSuggestions = false);
+        $$invalidate(5, showSuggestions = false);
       }
     } else if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -76632,20 +77623,28 @@ function instance$3($$self, $$props, $$invalidate) {
   }
   function send() {
     if (!value.trim() && selectedReferences.length === 0 && selectedImages.length === 0) return;
-    dispatch("send", {
+    dispatch2("send", {
       content: value,
       references: selectedReferences,
       images: selectedImages
     });
-    $$invalidate(2, value = "");
-    $$invalidate(5, selectedReferences = []);
-    $$invalidate(6, selectedImages = []);
+    $$invalidate(4, value = "");
+    $$invalidate(7, selectedReferences = []);
+    $$invalidate(8, selectedImages = []);
     setTimeout(autoGrow, 0);
   }
   function handlePlusClick() {
-    $$invalidate(2, value += "@");
-    inputElement.focus();
-    handleInput({ target: inputElement });
+    const opened = getOpenedNotes();
+    $$invalidate(3, openedNotes = opened);
+    currentSearchId++;
+    const searchId = currentSearchId;
+    searchBlocks("").then((searched) => {
+      if (searchId !== currentSearchId) return;
+      const openedIds = new Set(openedNotes.map((n) => n.id));
+      $$invalidate(2, suggestions = searched.filter((s) => !openedIds.has(s.id)));
+      $$invalidate(5, showSuggestions = openedNotes.length + suggestions.length > 0);
+      $$invalidate(6, selectedIndex = 0);
+    });
   }
   onMount(() => {
     autoGrow();
@@ -76657,23 +77656,27 @@ function instance$3($$self, $$props, $$invalidate) {
   function textarea_binding($$value) {
     binding_callbacks[$$value ? "unshift" : "push"](() => {
       inputElement = $$value;
-      $$invalidate(7, inputElement);
+      $$invalidate(9, inputElement);
     });
   }
   function textarea_input_handler() {
     value = this.value;
-    $$invalidate(2, value);
+    $$invalidate(4, value);
   }
   $$self.$$set = ($$props2) => {
-    if ("i18n" in $$props2) $$invalidate(17, i18n = $$props2.i18n);
+    if ("i18n" in $$props2) $$invalidate(19, i18n = $$props2.i18n);
+    if ("isLoading" in $$props2) $$invalidate(0, isLoading = $$props2.isLoading);
+    if ("onStop" in $$props2) $$invalidate(1, onStop = $$props2.onStop);
   };
   $$self.$$.update = () => {
     if ($$self.$$.dirty[0] & /*openedNotes, suggestions*/
-    3) {
+    12) {
       allSuggestions = [...openedNotes, ...suggestions];
     }
   };
   return [
+    isLoading,
+    onStop,
     suggestions,
     openedNotes,
     value,
@@ -76703,7 +77706,7 @@ function instance$3($$self, $$props, $$invalidate) {
 class InputBox extends SvelteComponent {
   constructor(options) {
     super();
-    init(this, options, instance$3, create_fragment$3, safe_not_equal, { i18n: 17 }, null, [-1, -1]);
+    init(this, options, instance$3, create_fragment$3, safe_not_equal, { i18n: 19, isLoading: 0, onStop: 1 }, null, [-1, -1]);
   }
 }
 async function* streamMessage(config, messages, signal) {
@@ -76977,17 +77980,17 @@ async function* chatGeminiStream(config, messages, signal) {
 }
 function get_each_context_1(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[17] = list2[i];
+  child_ctx[18] = list2[i];
   return child_ctx;
 }
 function get_each_context$1(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[14] = list2[i];
+  child_ctx[15] = list2[i];
   return child_ctx;
 }
 function get_each_context_2(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[20] = list2[i];
+  child_ctx[21] = list2[i];
   return child_ctx;
 }
 function create_if_block_3$1(ctx) {
@@ -76995,7 +77998,7 @@ function create_if_block_3$1(ctx) {
   return {
     c() {
       div = element("div");
-      attr(div, "class", "size-1.5 rounded-full bg-blue-500");
+      attr(div, "class", "size-2 rounded-full bg-white animate-pulse");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -77011,21 +78014,20 @@ function create_each_block_2(ctx) {
   let button;
   let span;
   let t1;
-  let t2;
   let button_class_value;
   let mounted;
   let dispose;
   let if_block = (
     /*activeTab*/
     ctx[1] === /*p*/
-    ctx[20].id && create_if_block_3$1()
+    ctx[21].id && create_if_block_3$1()
   );
   function click_handler_1() {
     return (
       /*click_handler_1*/
       ctx[10](
         /*p*/
-        ctx[20]
+        ctx[21]
       )
     );
   }
@@ -77034,20 +78036,18 @@ function create_each_block_2(ctx) {
       button = element("button");
       span = element("span");
       span.textContent = `${/*p*/
-      ctx[20].name}`;
+      ctx[21].name}`;
       t1 = space();
       if (if_block) if_block.c();
-      t2 = space();
-      attr(button, "class", button_class_value = "w-full px-3 py-2.5 text-sm font-normal text-left rounded-xl transition-all cursor-pointer flex items-center justify-between group " + /*activeTab*/
+      attr(button, "class", button_class_value = "w-full px-4 py-3 text-sm font-semibold text-left rounded-2xl transition-all cursor-pointer flex items-center justify-between group " + /*activeTab*/
       (ctx[1] === /*p*/
-      ctx[20].id ? "bg-white dark:bg-gray-800 text-black dark:text-white shadow-sm ring-1 ring-gray-200 dark:ring-gray-700" : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800/50"));
+      ctx[21].id ? "bg-blue-600 text-white shadow-lg shadow-blue-500/20" : "text-gray-600 dark:text-gray-400 hover:bg-blue-500/10 hover:text-blue-500"));
     },
     m(target, anchor) {
       insert(target, button, anchor);
       append(button, span);
       append(button, t1);
       if (if_block) if_block.m(button, null);
-      append(button, t2);
       if (!mounted) {
         dispose = listen(button, "click", click_handler_1);
         mounted = true;
@@ -77058,22 +78058,22 @@ function create_each_block_2(ctx) {
       if (
         /*activeTab*/
         ctx[1] === /*p*/
-        ctx[20].id
+        ctx[21].id
       ) {
         if (if_block) ;
         else {
           if_block = create_if_block_3$1();
           if_block.c();
-          if_block.m(button, t2);
+          if_block.m(button, null);
         }
       } else if (if_block) {
         if_block.d(1);
         if_block = null;
       }
       if (dirty & /*activeTab*/
-      2 && button_class_value !== (button_class_value = "w-full px-3 py-2.5 text-sm font-normal text-left rounded-xl transition-all cursor-pointer flex items-center justify-between group " + /*activeTab*/
+      2 && button_class_value !== (button_class_value = "w-full px-4 py-3 text-sm font-semibold text-left rounded-2xl transition-all cursor-pointer flex items-center justify-between group " + /*activeTab*/
       (ctx[1] === /*p*/
-      ctx[20].id ? "bg-white dark:bg-gray-800 text-black dark:text-white shadow-sm ring-1 ring-gray-200 dark:ring-gray-700" : "text-gray-500 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800/50"))) {
+      ctx[21].id ? "bg-blue-600 text-white shadow-lg shadow-blue-500/20" : "text-gray-600 dark:text-gray-400 hover:bg-blue-500/10 hover:text-blue-500"))) {
         attr(button, "class", button_class_value);
       }
     },
@@ -77110,7 +78110,7 @@ function create_else_block$1(ctx) {
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
-      attr(div, "class", "grid gap-2");
+      attr(div, "class", "grid gap-3");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -77186,7 +78186,7 @@ function create_if_block_1$1(ctx) {
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
-      attr(div, "class", "space-y-2.5");
+      attr(div, "class", "space-y-3");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -77215,11 +78215,12 @@ function create_if_block$2(ctx) {
   let p_1;
   let t1;
   let br2;
+  let span;
   let t2;
   let t3;
   let t4;
   let current;
-  refreshccw = new Refresh_ccw({ props: { size: 28 } });
+  refreshccw = new Refresh_ccw({ props: { size: 40 } });
   return {
     c() {
       div1 = element("div");
@@ -77229,15 +78230,17 @@ function create_if_block$2(ctx) {
       p_1 = element("p");
       t1 = text$3("Click the refresh button next to your API key");
       br2 = element("br");
-      t2 = text$3("to load the available models from ");
+      span = element("span");
+      t2 = text$3("to discover available models for ");
       t3 = text$3(
         /*activeTab*/
         ctx[1]
       );
       t4 = text$3(".");
-      attr(div0, "class", "p-4 bg-gray-50 dark:bg-gray-850 rounded-full text-gray-300 group-hover:scale-110 transition-transform");
-      attr(p_1, "class", "text-xs text-gray-400 leading-relaxed");
-      attr(div1, "class", "p-10 border-2 border-dashed border-gray-100 dark:border-gray-800 rounded-3xl flex flex-col items-center justify-center text-center gap-4 group hover:border-gray-200 dark:hover:border-gray-700 transition-colors");
+      attr(div0, "class", "p-6 bg-gradient-to-br from-blue-500/10 to-purple-500/10 rounded-full text-blue-500/30 group-hover:scale-110 group-hover:text-blue-500 transition-all duration-500");
+      attr(span, "class", "text-blue-500/50");
+      attr(p_1, "class", "text-sm text-gray-400 dark:text-gray-500 font-medium leading-relaxed");
+      attr(div1, "class", "p-12 glass-effect border-dashed border-2 border-white/10 rounded-[32px] flex flex-col items-center justify-center text-center gap-6 group hover:border-blue-500/30 transition-all");
     },
     m(target, anchor) {
       insert(target, div1, anchor);
@@ -77247,9 +78250,10 @@ function create_if_block$2(ctx) {
       append(div1, p_1);
       append(p_1, t1);
       append(p_1, br2);
-      append(p_1, t2);
-      append(p_1, t3);
-      append(p_1, t4);
+      append(p_1, span);
+      append(span, t2);
+      append(span, t3);
+      append(span, t4);
       current = true;
     },
     p(ctx2, dirty) {
@@ -77282,8 +78286,8 @@ function create_else_block_1$1(ctx) {
   let current;
   chevronright = new Chevron_right({
     props: {
-      size: 14,
-      class: "text-gray-300 opacity-0 group-hover:opacity-100 transition-all translate-x-[-4px] group-hover:translate-x-0"
+      size: 16,
+      class: "text-gray-400 opacity-0 group-hover:opacity-100 transition-all -translate-x-2 group-hover:translate-x-0"
     }
   });
   return {
@@ -77313,7 +78317,7 @@ function create_if_block_2$1(ctx) {
   return {
     c() {
       div = element("div");
-      attr(div, "class", "size-2 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]");
+      attr(div, "class", "size-2.5 rounded-full bg-blue-500 shadow-[0_0_12px_rgba(59,130,246,0.8)] animate-pulse");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -77332,9 +78336,10 @@ function create_each_block_1(ctx) {
   let span;
   let t0_value = (
     /*model*/
-    ctx[17] + ""
+    ctx[18] + ""
   );
   let t0;
+  let span_class_value;
   let t1;
   let current_block_type_index;
   let if_block;
@@ -77352,7 +78357,7 @@ function create_each_block_1(ctx) {
         /*activeTab*/
         ctx2[1]
       ] === /*model*/
-      ctx2[17]
+      ctx2[18]
     ) return 0;
     return 1;
   }
@@ -77361,9 +78366,9 @@ function create_each_block_1(ctx) {
   function click_handler_3() {
     return (
       /*click_handler_3*/
-      ctx[13](
+      ctx[14](
         /*model*/
-        ctx[17]
+        ctx[18]
       )
     );
   }
@@ -77375,13 +78380,18 @@ function create_each_block_1(ctx) {
       t1 = space();
       if_block.c();
       t2 = space();
-      attr(span, "class", "font-medium truncate");
-      attr(button, "class", button_class_value = "w-full px-5 py-3.5 rounded-xl border text-left text-sm transition-all flex items-center justify-between group cursor-pointer " + /*settings*/
+      attr(span, "class", span_class_value = "text-sm font-bold " + /*settings*/
       (ctx[0].models[
         /*activeTab*/
         ctx[1]
       ] === /*model*/
-      ctx[17] ? "bg-blue-50 dark:bg-blue-900/20 border-blue-500 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/20" : "bg-transparent border-gray-100 dark:border-gray-800 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-600"));
+      ctx[18] ? "text-blue-500" : "text-gray-600 dark:text-gray-300") + " truncate");
+      attr(button, "class", button_class_value = "w-full px-6 py-4 rounded-2xl border transition-all flex items-center justify-between group cursor-pointer " + /*settings*/
+      (ctx[0].models[
+        /*activeTab*/
+        ctx[1]
+      ] === /*model*/
+      ctx[18] ? "bg-gradient-to-r from-blue-600/10 to-purple-600/10 border-blue-500 shadow-lg shadow-blue-500/5" : "bg-white/5 border-white/5 hover:border-white/10 hover:bg-white/10"));
     },
     m(target, anchor) {
       insert(target, button, anchor);
@@ -77400,7 +78410,16 @@ function create_each_block_1(ctx) {
       ctx = new_ctx;
       if ((!current || dirty & /*availableModels, activeTab*/
       6) && t0_value !== (t0_value = /*model*/
-      ctx[17] + "")) set_data(t0, t0_value);
+      ctx[18] + "")) set_data(t0, t0_value);
+      if (!current || dirty & /*settings, activeTab, availableModels*/
+      7 && span_class_value !== (span_class_value = "text-sm font-bold " + /*settings*/
+      (ctx[0].models[
+        /*activeTab*/
+        ctx[1]
+      ] === /*model*/
+      ctx[18] ? "text-blue-500" : "text-gray-600 dark:text-gray-300") + " truncate")) {
+        attr(span, "class", span_class_value);
+      }
       let previous_block_index = current_block_type_index;
       current_block_type_index = select_block_type_1(ctx);
       if (current_block_type_index !== previous_block_index) {
@@ -77418,12 +78437,12 @@ function create_each_block_1(ctx) {
         if_block.m(button, t2);
       }
       if (!current || dirty & /*settings, activeTab, availableModels*/
-      7 && button_class_value !== (button_class_value = "w-full px-5 py-3.5 rounded-xl border text-left text-sm transition-all flex items-center justify-between group cursor-pointer " + /*settings*/
+      7 && button_class_value !== (button_class_value = "w-full px-6 py-4 rounded-2xl border transition-all flex items-center justify-between group cursor-pointer " + /*settings*/
       (ctx[0].models[
         /*activeTab*/
         ctx[1]
       ] === /*model*/
-      ctx[17] ? "bg-blue-50 dark:bg-blue-900/20 border-blue-500 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/20" : "bg-transparent border-gray-100 dark:border-gray-800 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-600"))) {
+      ctx[18] ? "bg-gradient-to-r from-blue-600/10 to-purple-600/10 border-blue-500 shadow-lg shadow-blue-500/5" : "bg-white/5 border-white/5 hover:border-white/10 hover:bg-white/10"))) {
         attr(button, "class", button_class_value);
       }
     },
@@ -77451,7 +78470,7 @@ function create_each_block$1(ctx) {
   return {
     c() {
       div = element("div");
-      attr(div, "class", "h-12 w-full bg-gray-50 dark:bg-gray-850 animate-pulse rounded-xl");
+      attr(div, "class", "h-14 w-full bg-white/5 animate-pulse rounded-2xl");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -77465,8 +78484,9 @@ function create_each_block$1(ctx) {
   };
 }
 function create_fragment$2(ctx) {
-  let div8;
+  let div12;
   let header;
+  let div1;
   let div0;
   let settings_1;
   let t0;
@@ -77475,46 +78495,55 @@ function create_fragment$2(ctx) {
   let button0;
   let x;
   let t3;
-  let div7;
+  let div11;
   let nav;
-  let div1;
+  let div2;
   let t5;
   let t6;
-  let main2;
-  let div6;
-  let div4;
-  let div2;
-  let label0;
-  let key;
-  let t7;
-  let t8;
-  let t9;
-  let t10;
-  let div3;
-  let input;
-  let input_placeholder_value;
-  let t11;
-  let button1;
-  let refreshccw;
-  let button1_disabled_value;
-  let t12;
   let div5;
+  let span1;
+  let t8;
+  let label0;
+  let span2;
+  let t10;
+  let div4;
+  let input0;
+  let t11;
+  let div3;
+  let t12;
+  let main2;
+  let div10;
+  let div8;
+  let div6;
   let label1;
-  let cpu;
+  let key;
   let t13;
   let t14;
   let t15;
+  let t16;
+  let div7;
+  let input1;
+  let input1_placeholder_value;
+  let t17;
+  let button1;
+  let refreshccw;
+  let button1_disabled_value;
+  let t18;
+  let div9;
+  let label2;
+  let cpu;
+  let t19;
+  let t20;
+  let t21;
   let current_block_type_index;
   let if_block;
-  let t16;
+  let t22;
   let footer;
   let current;
   let mounted;
   let dispose;
-  settings_1 = new Settings$1({
-    props: { class: "text-gray-500", size: 18 }
-  });
-  x = new X({ props: { size: 18 } });
+  settings_1 = new Settings$1({ props: { size: 20 } });
+  x = new X({ props: { size: 20, strokeWidth: 2.5 } });
   let each_value_2 = ensure_array_like(
     /*providers*/
     ctx[7]
@@ -77523,10 +78552,12 @@ function create_fragment$2(ctx) {
   for (let i = 0; i < each_value_2.length; i += 1) {
     each_blocks[i] = create_each_block_2(get_each_context_2(ctx, each_value_2, i));
   }
-  key = new Key({ props: { size: 12 } });
+  key = new Key({
+    props: { size: 14, class: "text-blue-500" }
+  });
   refreshccw = new Refresh_ccw({
     props: {
-      size: 18,
+      size: 20,
       class: (
         /*isFetching*/
         ctx[3][
@@ -77536,7 +78567,9 @@ function create_fragment$2(ctx) {
       )
     }
   });
-  cpu = new Cpu({ props: { size: 12 } });
+  cpu = new Cpu({
+    props: { size: 14, class: "text-purple-500" }
+  });
   const if_block_creators = [create_if_block$2, create_if_block_1$1, create_else_block$1];
   const if_blocks = [];
   function select_block_type(ctx2, dirty) {
@@ -77564,8 +78597,9 @@ function create_fragment$2(ctx) {
   if_block = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
   return {
     c() {
-      div8 = element("div");
+      div12 = element("div");
       header = element("header");
+      div1 = element("div");
       div0 = element("div");
       create_component(settings_1.$$.fragment);
       t0 = space();
@@ -77575,136 +78609,172 @@ function create_fragment$2(ctx) {
       button0 = element("button");
       create_component(x.$$.fragment);
       t3 = space();
-      div7 = element("div");
+      div11 = element("div");
       nav = element("nav");
-      div1 = element("div");
-      div1.innerHTML = `<span class="text-xs font-medium text-gray-400">Providers</span>`;
+      div2 = element("div");
+      div2.innerHTML = `<span class="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">Providers</span>`;
       t5 = space();
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
       t6 = space();
-      main2 = element("main");
-      div6 = element("div");
-      div4 = element("div");
-      div2 = element("div");
-      label0 = element("label");
-      create_component(key.$$.fragment);
-      t7 = space();
-      t8 = text$3(
-        /*activeTab*/
-        ctx[1]
-      );
-      t9 = text$3(" API Key");
-      t10 = space();
-      div3 = element("div");
-      input = element("input");
-      t11 = space();
-      button1 = element("button");
-      create_component(refreshccw.$$.fragment);
-      t12 = space();
       div5 = element("div");
+      span1 = element("span");
+      span1.textContent = "Debug";
+      t8 = space();
+      label0 = element("label");
+      span2 = element("span");
+      span2.textContent = "Debug Mode";
+      t10 = space();
+      div4 = element("div");
+      input0 = element("input");
+      t11 = space();
+      div3 = element("div");
+      t12 = space();
+      main2 = element("main");
+      div10 = element("div");
+      div8 = element("div");
+      div6 = element("div");
       label1 = element("label");
-      create_component(cpu.$$.fragment);
-      t13 = text$3("\r\n                        Default Model for ");
+      create_component(key.$$.fragment);
+      t13 = space();
       t14 = text$3(
         /*activeTab*/
         ctx[1]
       );
-      t15 = space();
-      if_block.c();
+      t15 = text$3(" API Key");
       t16 = space();
+      div7 = element("div");
+      input1 = element("input");
+      t17 = space();
+      button1 = element("button");
+      create_component(refreshccw.$$.fragment);
+      t18 = space();
+      div9 = element("div");
+      label2 = element("label");
+      create_component(cpu.$$.fragment);
+      t19 = text$3("\r\n                        Default Model for ");
+      t20 = text$3(
+        /*activeTab*/
+        ctx[1]
+      );
+      t21 = space();
+      if_block.c();
+      t22 = space();
       footer = element("footer");
-      footer.innerHTML = `<span class="text-[10px] text-gray-400 font-medium uppercase tracking-widest">Settings are saved automatically</span>`;
-      attr(h2, "class", "text-base font-semibold text-gray-800 dark:text-gray-100");
-      attr(div0, "class", "flex items-center gap-2");
-      attr(button0, "class", "p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-500 transition-colors cursor-pointer");
-      attr(header, "class", "flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-800 shrink-0");
-      attr(div1, "class", "px-3 py-2 mb-1");
-      attr(nav, "class", "w-40 border-r border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-850/50 flex flex-col py-2 px-2 gap-1 overflow-y-auto");
-      attr(label0, "class", "text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] flex items-center gap-2");
-      attr(div2, "class", "flex items-center justify-between");
-      attr(input, "type", "password");
-      attr(input, "placeholder", input_placeholder_value = `Paste your ${/*activeTab*/
+      footer.innerHTML = `<span class="text-[10px] text-gray-400 dark:text-gray-500 font-bold uppercase tracking-[0.3em]">Cloud-Sync: Changes are saved instantly</span>`;
+      attr(div0, "class", "p-2 bg-gradient-to-br from-blue-500 to-purple-500 rounded-full text-white shadow-lg");
+      attr(h2, "class", "text-lg font-bold gemini-gradient-text tracking-tight");
+      attr(div1, "class", "flex items-center gap-3");
+      attr(button0, "class", "w-10 h-10 flex items-center justify-center rounded-full hover:bg-red-500/10 text-gray-500 hover:text-red-500 transition-all cursor-pointer hover:scale-110 active:scale-90");
+      attr(header, "class", "flex items-center justify-between px-6 py-4 glass-effect shrink-0");
+      attr(div2, "class", "px-3 py-2 mb-2");
+      attr(span1, "class", "text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] block mb-3");
+      attr(span2, "class", "text-xs font-semibold text-gray-600 dark:text-gray-400 group-hover:text-blue-500 transition-colors");
+      attr(input0, "type", "checkbox");
+      attr(input0, "class", "sr-only peer");
+      attr(div3, "class", "w-8 h-4 bg-gray-200 peer-focus:outline-none dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blue-600 rounded-full");
+      attr(div4, "class", "relative inline-flex items-center");
+      attr(label0, "class", "flex items-center justify-between cursor-pointer group");
+      attr(div5, "class", "px-3 py-2 mt-auto mb-2 border-t border-white/5 pt-4");
+      attr(nav, "class", "w-48 glass-effect border-r border-white/5 flex flex-col py-4 px-3 gap-1 overflow-y-auto custom-scrollbar");
+      attr(label1, "class", "text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] flex items-center gap-2");
+      attr(div6, "class", "flex items-center justify-between");
+      attr(input1, "type", "password");
+      attr(input1, "placeholder", input1_placeholder_value = `Paste your ${/*activeTab*/
       ctx[1]} key here...`);
-      attr(input, "class", "flex-1 px-4 py-3 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 rounded-xl text-sm outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all");
-      attr(button1, "class", "px-4 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300 transition-all flex items-center justify-center cursor-pointer border border-transparent");
+      attr(input1, "class", "flex-1 px-5 py-3.5 bg-white/5 border border-white/10 rounded-2xl text-sm outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500/50 transition-all font-mono");
+      attr(button1, "class", "px-5 rounded-2xl glass-effect hover:bg-blue-500/10 text-blue-500 transition-all flex items-center justify-center cursor-pointer hover:scale-105 active:scale-95 shadow-md");
       attr(button1, "title", "Fetch Models");
       button1.disabled = button1_disabled_value = /*isFetching*/
       ctx[3][
         /*activeTab*/
         ctx[1]
       ];
-      attr(div3, "class", "flex gap-2");
-      attr(div4, "class", "space-y-3");
-      attr(label1, "class", "text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] flex items-center gap-2");
-      attr(div5, "class", "space-y-4");
-      attr(div6, "class", "max-w-xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-300");
+      attr(div7, "class", "flex gap-3");
+      attr(div8, "class", "space-y-4");
+      attr(label2, "class", "text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] flex items-center gap-2");
+      attr(div9, "class", "space-y-6");
+      attr(div10, "class", "max-w-2xl mx-auto space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-500");
       attr(
-        div6,
+        div10,
         "key",
         /*activeTab*/
         ctx[1]
       );
-      attr(main2, "class", "flex-1 overflow-y-auto p-6 bg-white dark:bg-gray-900");
-      attr(div7, "class", "flex-1 flex overflow-hidden");
-      attr(footer, "class", "p-3 border-t border-gray-100 dark:border-gray-800 bg-gray-50/10 dark:bg-gray-850/10 shrink-0 text-center");
-      attr(div8, "class", "flex flex-col h-full bg-white dark:bg-gray-900 overflow-hidden font-sans");
+      attr(main2, "class", "flex-1 overflow-y-auto p-8 custom-scrollbar");
+      attr(div11, "class", "flex-1 flex overflow-hidden");
+      attr(footer, "class", "p-4 glass-effect border-t border-white/5 text-center");
+      attr(div12, "class", "flex flex-col h-full bg-transparent overflow-hidden font-sans");
     },
     m(target, anchor) {
-      insert(target, div8, anchor);
-      append(div8, header);
-      append(header, div0);
+      insert(target, div12, anchor);
+      append(div12, header);
+      append(header, div1);
+      append(div1, div0);
       mount_component(settings_1, div0, null);
-      append(div0, t0);
-      append(div0, h2);
+      append(div1, t0);
+      append(div1, h2);
       append(header, t2);
       append(header, button0);
       mount_component(x, button0, null);
-      append(div8, t3);
-      append(div8, div7);
-      append(div7, nav);
-      append(nav, div1);
+      append(div12, t3);
+      append(div12, div11);
+      append(div11, nav);
+      append(nav, div2);
       append(nav, t5);
       for (let i = 0; i < each_blocks.length; i += 1) {
         if (each_blocks[i]) {
           each_blocks[i].m(nav, null);
         }
       }
-      append(div7, t6);
-      append(div7, main2);
-      append(main2, div6);
-      append(div6, div4);
-      append(div4, div2);
-      append(div2, label0);
-      mount_component(key, label0, null);
-      append(label0, t7);
-      append(label0, t8);
-      append(label0, t9);
-      append(div4, t10);
+      append(nav, t6);
+      append(nav, div5);
+      append(div5, span1);
+      append(div5, t8);
+      append(div5, label0);
+      append(label0, span2);
+      append(label0, t10);
+      append(label0, div4);
+      append(div4, input0);
+      input0.checked = /*settings*/
+      ctx[0].debugMode;
+      append(div4, t11);
       append(div4, div3);
-      append(div3, input);
+      append(div11, t12);
+      append(div11, main2);
+      append(main2, div10);
+      append(div10, div8);
+      append(div8, div6);
+      append(div6, label1);
+      mount_component(key, label1, null);
+      append(label1, t13);
+      append(label1, t14);
+      append(label1, t15);
+      append(div8, t16);
+      append(div8, div7);
+      append(div7, input1);
       set_input_value(
-        input,
+        input1,
         /*settings*/
         ctx[0].keys[
           /*activeTab*/
           ctx[1]
         ]
       );
-      append(div3, t11);
-      append(div3, button1);
+      append(div7, t17);
+      append(div7, button1);
       mount_component(refreshccw, button1, null);
-      append(div6, t12);
-      append(div6, div5);
-      append(div5, label1);
-      mount_component(cpu, label1, null);
-      append(label1, t13);
-      append(label1, t14);
-      append(div5, t15);
-      if_blocks[current_block_type_index].m(div5, null);
-      append(div8, t16);
-      append(div8, footer);
+      append(div10, t18);
+      append(div10, div9);
+      append(div9, label2);
+      mount_component(cpu, label2, null);
+      append(label2, t19);
+      append(label2, t20);
+      append(div9, t21);
+      if_blocks[current_block_type_index].m(div9, null);
+      append(div12, t22);
+      append(div12, footer);
       current = true;
       if (!mounted) {
         dispose = [
@@ -77715,13 +78785,25 @@ function create_fragment$2(ctx) {
             ctx[9]
           ),
           listen(
-            input,
-            "input",
-            /*input_input_handler*/
+            input0,
+            "change",
+            /*input0_change_handler*/
             ctx[11]
           ),
           listen(
-            input,
+            input0,
+            "change",
+            /*autoSave*/
+            ctx[5]
+          ),
+          listen(
+            input1,
+            "input",
+            /*input1_input_handler*/
+            ctx[12]
+          ),
+          listen(
+            input1,
             "input",
             /*autoSave*/
             ctx[5]
@@ -77730,7 +78812,7 @@ function create_fragment$2(ctx) {
             button1,
             "click",
             /*click_handler_2*/
-            ctx[12]
+            ctx[13]
           )
         ];
         mounted = true;
@@ -77751,7 +78833,7 @@ function create_fragment$2(ctx) {
           } else {
             each_blocks[i] = create_each_block_2(child_ctx);
             each_blocks[i].c();
-            each_blocks[i].m(nav, null);
+            each_blocks[i].m(nav, t6);
           }
         }
         for (; i < each_blocks.length; i += 1) {
@@ -77759,25 +78841,30 @@ function create_fragment$2(ctx) {
         }
         each_blocks.length = each_value_2.length;
       }
+      if (dirty & /*settings*/
+      1) {
+        input0.checked = /*settings*/
+        ctx2[0].debugMode;
+      }
       if (!current || dirty & /*activeTab*/
       2) set_data(
-        t8,
+        t14,
         /*activeTab*/
         ctx2[1]
       );
       if (!current || dirty & /*activeTab*/
-      2 && input_placeholder_value !== (input_placeholder_value = `Paste your ${/*activeTab*/
+      2 && input1_placeholder_value !== (input1_placeholder_value = `Paste your ${/*activeTab*/
       ctx2[1]} key here...`)) {
-        attr(input, "placeholder", input_placeholder_value);
+        attr(input1, "placeholder", input1_placeholder_value);
       }
       if (dirty & /*settings, activeTab*/
-      3 && input.value !== /*settings*/
+      3 && input1.value !== /*settings*/
       ctx2[0].keys[
         /*activeTab*/
         ctx2[1]
       ]) {
         set_input_value(
-          input,
+          input1,
           /*settings*/
           ctx2[0].keys[
             /*activeTab*/
@@ -77803,7 +78890,7 @@ function create_fragment$2(ctx) {
       }
       if (!current || dirty & /*activeTab*/
       2) set_data(
-        t14,
+        t20,
         /*activeTab*/
         ctx2[1]
       );
@@ -77825,12 +78912,12 @@ function create_fragment$2(ctx) {
           if_block.p(ctx2, dirty);
         }
         transition_in(if_block, 1);
-        if_block.m(div5, null);
+        if_block.m(div9, null);
       }
       if (!current || dirty & /*activeTab*/
       2) {
         attr(
-          div6,
+          div10,
           "key",
           /*activeTab*/
           ctx2[1]
@@ -77858,7 +78945,7 @@ function create_fragment$2(ctx) {
     },
     d(detaching) {
       if (detaching) {
-        detach(div8);
+        detach(div12);
       }
       destroy_component(settings_1);
       destroy_component(x);
@@ -77874,7 +78961,7 @@ function create_fragment$2(ctx) {
 }
 function instance$2($$self, $$props, $$invalidate) {
   let { plugin } = $$props;
-  const dispatch = createEventDispatcher();
+  const dispatch2 = createEventDispatcher();
   let settings = {
     provider: "openai",
     keys: {
@@ -77889,6 +78976,7 @@ function instance$2($$self, $$props, $$invalidate) {
       gemini: "",
       deepseek: ""
     },
+    debugMode: false,
     ...plugin.data["chat-settings"]
   };
   if (!settings.models) {
@@ -77948,12 +79036,16 @@ function instance$2($$self, $$props, $$invalidate) {
     { id: "gemini", name: "Gemini" },
     { id: "deepseek", name: "DeepSeek" }
   ];
-  const click_handler = () => dispatch("close");
+  const click_handler = () => dispatch2("close");
   const click_handler_1 = (p) => {
     $$invalidate(1, activeTab = p.id);
     autoSave();
   };
-  function input_input_handler() {
+  function input0_change_handler() {
+    settings.debugMode = this.checked;
+    $$invalidate(0, settings);
+  }
+  function input1_input_handler() {
     settings.keys[activeTab] = this.value;
     $$invalidate(0, settings);
   }
@@ -77980,14 +79072,15 @@ function instance$2($$self, $$props, $$invalidate) {
     activeTab,
     availableModels,
     isFetching,
-    dispatch,
+    dispatch2,
     autoSave,
     refreshModels,
     providers,
     plugin,
     click_handler,
     click_handler_1,
-    input_input_handler,
+    input0_change_handler,
+    input1_input_handler,
     click_handler_2,
     click_handler_3
   ];
@@ -78000,18 +79093,22 @@ class SettingsView extends SvelteComponent {
 }
 function get_each_context(ctx, list2, i) {
   const child_ctx = ctx.slice();
-  child_ctx[25] = list2[i];
+  child_ctx[24] = list2[i];
   return child_ctx;
 }
 function create_else_block(ctx) {
-  var _a, _b;
+  var _a, _b, _c;
   let t0;
   let div5;
   let header;
-  let div0;
-  let t1;
   let div1;
-  let button;
+  let button0;
+  let current_block_type_index;
+  let if_block1;
+  let button0_title_value;
+  let t1;
+  let div0;
+  let button1;
   let t2_value = (
     /*plugin*/
     (((_a = ctx[0].data["chat-settings"]) == null ? void 0 : _a.model) || "AI Chat") + ""
@@ -78022,32 +79119,39 @@ function create_else_block(ctx) {
   let t4;
   let t5;
   let div2;
-  let t6;
-  let div3;
   let messagelist;
-  let t7;
+  let t6;
   let div4;
-  let t8;
+  let div3;
   let inputbox;
   let current;
   let mounted;
   let dispose;
   let if_block0 = (
     /*showSidebar*/
-    ctx[1] && create_if_block_6(ctx)
+    ctx[1] && create_if_block_5(ctx)
   );
-  let if_block1 = !/*showSidebar*/
-  ctx[1] && create_if_block_5(ctx);
+  const if_block_creators = [create_if_block_4, create_else_block_2];
+  const if_blocks = [];
+  function select_block_type_1(ctx2, dirty) {
+    if (
+      /*showSidebar*/
+      ctx2[1]
+    ) return 0;
+    return 1;
+  }
+  current_block_type_index = select_block_type_1(ctx);
+  if_block1 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx);
   chevrondown = new Chevron_down({
     props: {
-      size: 14,
-      class: "text-gray-400 transition-transform " + /*showModelPicker*/
+      size: 12,
+      class: "text-blue-500/70 transition-transform " + /*showModelPicker*/
       (ctx[3] ? "rotate-180" : "")
     }
   });
   let if_block2 = (
     /*showModelPicker*/
-    ctx[3] && create_if_block_2(ctx)
+    ctx[3] && create_if_block_1(ctx)
   );
   messagelist = new MessageList({
     props: {
@@ -78058,6 +79162,10 @@ function create_else_block(ctx) {
       isLoading: (
         /*isLoading*/
         ctx[2]
+      ),
+      debugMode: (
+        /*plugin*/
+        (_c = ctx[0].data["chat-settings"]) == null ? void 0 : _c.debugMode
       )
     }
   });
@@ -78066,14 +79174,22 @@ function create_else_block(ctx) {
     /*handleRegenerate*/
     ctx[10]
   );
-  let if_block3 = (
-    /*isLoading*/
-    ctx[2] && create_if_block_1(ctx)
-  );
-  inputbox = new InputBox({ props: { i18n: (
-    /*plugin*/
-    ctx[0].i18n
-  ) } });
+  inputbox = new InputBox({
+    props: {
+      i18n: (
+        /*plugin*/
+        ctx[0].i18n
+      ),
+      isLoading: (
+        /*isLoading*/
+        ctx[2]
+      ),
+      onStop: (
+        /*stopResponse*/
+        ctx[9]
+      )
+    }
+  });
   inputbox.$on(
     "send",
     /*handleSend*/
@@ -78085,11 +79201,12 @@ function create_else_block(ctx) {
       t0 = space();
       div5 = element("div");
       header = element("header");
-      div0 = element("div");
-      if (if_block1) if_block1.c();
-      t1 = space();
       div1 = element("div");
-      button = element("button");
+      button0 = element("button");
+      if_block1.c();
+      t1 = space();
+      div0 = element("div");
+      button1 = element("button");
       t2 = text$3(t2_value);
       t3 = space();
       create_component(chevrondown.$$.fragment);
@@ -78097,21 +79214,21 @@ function create_else_block(ctx) {
       if (if_block2) if_block2.c();
       t5 = space();
       div2 = element("div");
-      t6 = space();
-      div3 = element("div");
       create_component(messagelist.$$.fragment);
-      t7 = space();
+      t6 = space();
       div4 = element("div");
-      if (if_block3) if_block3.c();
-      t8 = space();
+      div3 = element("div");
       create_component(inputbox.$$.fragment);
-      attr(div0, "class", "flex items-center w-12");
-      attr(button, "class", "font-medium text-lg flex items-center gap-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-850 px-3 py-1.5 rounded-xl transition-colors border-none bg-transparent");
-      attr(div1, "class", "relative");
-      attr(div2, "class", "w-12");
-      attr(header, "class", "flex items-center justify-between px-2 py-2 bg-white dark:bg-gray-900 z-1 sticky top-0 border-b border-transparent");
-      attr(div3, "class", "flex-1 overflow-hidden relative flex flex-col items-center w-full");
-      attr(div4, "class", "w-full flex flex-col items-center bg-white dark:bg-gray-900 pt-2 pb-6 z-1");
+      attr(button0, "class", "w-9 h-9 flex items-center justify-center rounded-full hover:bg-gray-500/10 dark:hover:bg-white/10 text-gray-600 dark:text-gray-300 transition-all cursor-pointer hover:scale-110 active:scale-95 group relative z-50");
+      attr(button0, "title", button0_title_value = /*showSidebar*/
+      ctx[1] ? "Close Sidebar" : "Open Sidebar");
+      attr(button1, "class", "font-semibold text-sm flex items-center gap-1.5 cursor-pointer hover:bg-white/40 dark:hover:bg-gray-800/40 px-3 py-1.5 rounded-full transition-all border-none bg-transparent gemini-gradient-text");
+      attr(div0, "class", "relative");
+      attr(div1, "class", "flex items-center gap-2");
+      attr(header, "class", "flex items-center gap-3 px-3 py-2 glass-effect sticky top-0 z-30 transition-all duration-300");
+      attr(div2, "class", "flex-1 overflow-hidden relative flex flex-col items-center w-full");
+      attr(div3, "class", "w-full max-w-4xl px-4");
+      attr(div4, "class", "w-full flex flex-col items-center bg-transparent pt-2 pb-2 z-10 relative");
       attr(div5, "class", "flex-1 flex flex-col h-full relative min-w-0");
     },
     m(target, anchor) {
@@ -78119,37 +79236,41 @@ function create_else_block(ctx) {
       insert(target, t0, anchor);
       insert(target, div5, anchor);
       append(div5, header);
-      append(header, div0);
-      if (if_block1) if_block1.m(div0, null);
-      append(header, t1);
       append(header, div1);
-      append(div1, button);
-      append(button, t2);
-      append(button, t3);
-      mount_component(chevrondown, button, null);
-      append(div1, t4);
-      if (if_block2) if_block2.m(div1, null);
-      append(header, t5);
-      append(header, div2);
+      append(div1, button0);
+      if_blocks[current_block_type_index].m(button0, null);
+      append(div1, t1);
+      append(div1, div0);
+      append(div0, button1);
+      append(button1, t2);
+      append(button1, t3);
+      mount_component(chevrondown, button1, null);
+      append(div0, t4);
+      if (if_block2) if_block2.m(div0, null);
+      append(div5, t5);
+      append(div5, div2);
+      mount_component(messagelist, div2, null);
       append(div5, t6);
-      append(div5, div3);
-      mount_component(messagelist, div3, null);
-      append(div5, t7);
       append(div5, div4);
-      if (if_block3) if_block3.m(div4, null);
-      append(div4, t8);
-      mount_component(inputbox, div4, null);
+      append(div4, div3);
+      mount_component(inputbox, div3, null);
       current = true;
       if (!mounted) {
-        dispose = listen(button, "click", stop_propagation(
-          /*click_handler_2*/
-          ctx[19]
-        ));
+        dispose = [
+          listen(button0, "click", stop_propagation(
+            /*click_handler_1*/
+            ctx[18]
+          )),
+          listen(button1, "click", stop_propagation(
+            /*click_handler_2*/
+            ctx[19]
+          ))
+        ];
         mounted = true;
       }
     },
     p(ctx2, dirty) {
-      var _a2, _b2;
+      var _a2, _b2, _c2;
       if (
         /*showSidebar*/
         ctx2[1]
@@ -78161,7 +79282,7 @@ function create_else_block(ctx) {
             transition_in(if_block0, 1);
           }
         } else {
-          if_block0 = create_if_block_6(ctx2);
+          if_block0 = create_if_block_5(ctx2);
           if_block0.c();
           transition_in(if_block0, 1);
           if_block0.m(t0.parentNode, t0);
@@ -78173,33 +79294,33 @@ function create_else_block(ctx) {
         });
         check_outros();
       }
-      if (!/*showSidebar*/
-      ctx2[1]) {
-        if (if_block1) {
-          if_block1.p(ctx2, dirty);
-          if (dirty & /*showSidebar*/
-          2) {
-            transition_in(if_block1, 1);
-          }
-        } else {
-          if_block1 = create_if_block_5(ctx2);
-          if_block1.c();
-          transition_in(if_block1, 1);
-          if_block1.m(div0, null);
-        }
-      } else if (if_block1) {
+      let previous_block_index = current_block_type_index;
+      current_block_type_index = select_block_type_1(ctx2);
+      if (current_block_type_index !== previous_block_index) {
         group_outros();
-        transition_out(if_block1, 1, 1, () => {
-          if_block1 = null;
+        transition_out(if_blocks[previous_block_index], 1, 1, () => {
+          if_blocks[previous_block_index] = null;
         });
         check_outros();
+        if_block1 = if_blocks[current_block_type_index];
+        if (!if_block1) {
+          if_block1 = if_blocks[current_block_type_index] = if_block_creators[current_block_type_index](ctx2);
+          if_block1.c();
+        }
+        transition_in(if_block1, 1);
+        if_block1.m(button0, null);
+      }
+      if (!current || dirty & /*showSidebar*/
+      2 && button0_title_value !== (button0_title_value = /*showSidebar*/
+      ctx2[1] ? "Close Sidebar" : "Open Sidebar")) {
+        attr(button0, "title", button0_title_value);
       }
       if ((!current || dirty & /*plugin*/
       1) && t2_value !== (t2_value = /*plugin*/
       (((_a2 = ctx2[0].data["chat-settings"]) == null ? void 0 : _a2.model) || "AI Chat") + "")) set_data(t2, t2_value);
       const chevrondown_changes = {};
       if (dirty & /*showModelPicker*/
-      8) chevrondown_changes.class = "text-gray-400 transition-transform " + /*showModelPicker*/
+      8) chevrondown_changes.class = "text-blue-500/70 transition-transform " + /*showModelPicker*/
       (ctx2[3] ? "rotate-180" : "");
       chevrondown.$set(chevrondown_changes);
       if (
@@ -78209,9 +79330,9 @@ function create_else_block(ctx) {
         if (if_block2) {
           if_block2.p(ctx2, dirty);
         } else {
-          if_block2 = create_if_block_2(ctx2);
+          if_block2 = create_if_block_1(ctx2);
           if_block2.c();
-          if_block2.m(div1, null);
+          if_block2.m(div0, null);
         }
       } else if (if_block2) {
         if_block2.d(1);
@@ -78224,34 +79345,17 @@ function create_else_block(ctx) {
       if (dirty & /*isLoading*/
       4) messagelist_changes.isLoading = /*isLoading*/
       ctx2[2];
+      if (dirty & /*plugin*/
+      1) messagelist_changes.debugMode = /*plugin*/
+      (_c2 = ctx2[0].data["chat-settings"]) == null ? void 0 : _c2.debugMode;
       messagelist.$set(messagelist_changes);
-      if (
-        /*isLoading*/
-        ctx2[2]
-      ) {
-        if (if_block3) {
-          if_block3.p(ctx2, dirty);
-          if (dirty & /*isLoading*/
-          4) {
-            transition_in(if_block3, 1);
-          }
-        } else {
-          if_block3 = create_if_block_1(ctx2);
-          if_block3.c();
-          transition_in(if_block3, 1);
-          if_block3.m(div4, t8);
-        }
-      } else if (if_block3) {
-        group_outros();
-        transition_out(if_block3, 1, 1, () => {
-          if_block3 = null;
-        });
-        check_outros();
-      }
       const inputbox_changes = {};
       if (dirty & /*plugin*/
       1) inputbox_changes.i18n = /*plugin*/
       ctx2[0].i18n;
+      if (dirty & /*isLoading*/
+      4) inputbox_changes.isLoading = /*isLoading*/
+      ctx2[2];
       inputbox.$set(inputbox_changes);
     },
     i(local) {
@@ -78260,7 +79364,6 @@ function create_else_block(ctx) {
       transition_in(if_block1);
       transition_in(chevrondown.$$.fragment, local);
       transition_in(messagelist.$$.fragment, local);
-      transition_in(if_block3);
       transition_in(inputbox.$$.fragment, local);
       current = true;
     },
@@ -78269,7 +79372,6 @@ function create_else_block(ctx) {
       transition_out(if_block1);
       transition_out(chevrondown.$$.fragment, local);
       transition_out(messagelist.$$.fragment, local);
-      transition_out(if_block3);
       transition_out(inputbox.$$.fragment, local);
       current = false;
     },
@@ -78279,18 +79381,18 @@ function create_else_block(ctx) {
         detach(div5);
       }
       if (if_block0) if_block0.d(detaching);
-      if (if_block1) if_block1.d();
+      if_blocks[current_block_type_index].d();
       destroy_component(chevrondown);
       if (if_block2) if_block2.d();
       destroy_component(messagelist);
-      if (if_block3) if_block3.d();
       destroy_component(inputbox);
       mounted = false;
-      dispose();
+      run_all(dispose);
     }
   };
 }
 function create_if_block$1(ctx) {
+  let div;
   let settingsview;
   let current;
   settingsview = new SettingsView({ props: { plugin: (
@@ -78304,10 +79406,13 @@ function create_if_block$1(ctx) {
   );
   return {
     c() {
+      div = element("div");
       create_component(settingsview.$$.fragment);
+      attr(div, "class", "absolute inset-0 z-50 glass-effect-strong animate-in fade-in duration-300");
     },
     m(target, anchor) {
-      mount_component(settingsview, target, anchor);
+      insert(target, div, anchor);
+      mount_component(settingsview, div, null);
       current = true;
     },
     p(ctx2, dirty) {
@@ -78327,15 +79432,20 @@ function create_if_block$1(ctx) {
       current = false;
     },
     d(detaching) {
-      destroy_component(settingsview, detaching);
+      if (detaching) {
+        detach(div);
+      }
+      destroy_component(settingsview);
     }
   };
 }
-function create_if_block_6(ctx) {
+function create_if_block_5(ctx) {
   let div0;
+  let div0_transition;
   let t;
   let div1;
   let sidebar;
+  let div1_transition;
   let current;
   let mounted;
   let dispose;
@@ -78367,8 +79477,8 @@ function create_if_block_6(ctx) {
       t = space();
       div1 = element("div");
       create_component(sidebar.$$.fragment);
-      attr(div0, "class", "absolute inset-0 bg-black/20 dark:bg-black/40 z-10");
-      attr(div1, "class", "absolute top-0 bottom-0 left-0 z-20 shadow-2xl");
+      attr(div0, "class", "absolute inset-0 bg-black/10 dark:bg-black/30 backdrop-blur-sm z-30");
+      attr(div1, "class", "absolute top-0 bottom-0 left-0 z-40 shadow-2xl");
     },
     m(target, anchor) {
       insert(target, div0, anchor);
@@ -78398,11 +79508,33 @@ function create_if_block_6(ctx) {
     },
     i(local) {
       if (current) return;
+      if (local) {
+        add_render_callback(() => {
+          if (!current) return;
+          if (!div0_transition) div0_transition = create_bidirectional_transition(div0, fade, { duration: 200 }, true);
+          div0_transition.run(1);
+        });
+      }
       transition_in(sidebar.$$.fragment, local);
+      if (local) {
+        add_render_callback(() => {
+          if (!current) return;
+          if (!div1_transition) div1_transition = create_bidirectional_transition(div1, fly, { x: -320, duration: 250 }, true);
+          div1_transition.run(1);
+        });
+      }
       current = true;
     },
     o(local) {
+      if (local) {
+        if (!div0_transition) div0_transition = create_bidirectional_transition(div0, fade, { duration: 200 }, false);
+        div0_transition.run(0);
+      }
       transition_out(sidebar.$$.fragment, local);
+      if (local) {
+        if (!div1_transition) div1_transition = create_bidirectional_transition(div1, fly, { x: -320, duration: 250 }, false);
+        div1_transition.run(0);
+      }
       current = false;
     },
     d(detaching) {
@@ -78411,70 +79543,90 @@ function create_if_block_6(ctx) {
         detach(t);
         detach(div1);
       }
+      if (detaching && div0_transition) div0_transition.end();
       destroy_component(sidebar);
+      if (detaching && div1_transition) div1_transition.end();
       mounted = false;
       dispose();
     }
   };
 }
-function create_if_block_5(ctx) {
-  let button;
-  let panelleftopen;
+function create_else_block_2(ctx) {
+  let menu;
   let current;
-  let mounted;
-  let dispose;
-  panelleftopen = new Panel_left_open({ props: { size: 20, strokeWidth: 1.5 } });
+  menu = new Menu({
+    props: {
+      size: 18,
+      strokeWidth: 1.5,
+      class: "group-hover:text-blue-500 transition-colors"
+    }
+  });
   return {
     c() {
-      button = element("button");
-      create_component(panelleftopen.$$.fragment);
-      attr(button, "class", "p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 text-gray-500 dark:text-gray-400 transition-colors cursor-pointer");
-      attr(button, "title", "Open Sidebar");
+      create_component(menu.$$.fragment);
     },
     m(target, anchor) {
-      insert(target, button, anchor);
-      mount_component(panelleftopen, button, null);
+      mount_component(menu, target, anchor);
       current = true;
-      if (!mounted) {
-        dispose = listen(button, "click", stop_propagation(
-          /*click_handler_1*/
-          ctx[18]
-        ));
-        mounted = true;
-      }
     },
-    p: noop,
     i(local) {
       if (current) return;
-      transition_in(panelleftopen.$$.fragment, local);
+      transition_in(menu.$$.fragment, local);
       current = true;
     },
     o(local) {
-      transition_out(panelleftopen.$$.fragment, local);
+      transition_out(menu.$$.fragment, local);
       current = false;
     },
     d(detaching) {
-      if (detaching) {
-        detach(button);
-      }
-      destroy_component(panelleftopen);
-      mounted = false;
-      dispose();
+      destroy_component(menu, detaching);
     }
   };
 }
-function create_if_block_2(ctx) {
+function create_if_block_4(ctx) {
+  let x;
+  let current;
+  x = new X({
+    props: {
+      size: 18,
+      strokeWidth: 1.5,
+      class: "group-hover:text-red-500 transition-colors"
+    }
+  });
+  return {
+    c() {
+      create_component(x.$$.fragment);
+    },
+    m(target, anchor) {
+      mount_component(x, target, anchor);
+      current = true;
+    },
+    i(local) {
+      if (current) return;
+      transition_in(x.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(x.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      destroy_component(x, detaching);
+    }
+  };
+}
+function create_if_block_1(ctx) {
   let div1;
   let div0;
   let t1;
-  function select_block_type_1(ctx2, dirty) {
+  function select_block_type_2(ctx2, dirty) {
     if (
       /*availableModels*/
       ctx2[4].length === 0
-    ) return create_if_block_3;
+    ) return create_if_block_2;
     return create_else_block_1;
   }
-  let current_block_type = select_block_type_1(ctx);
+  let current_block_type = select_block_type_2(ctx);
   let if_block = current_block_type(ctx);
   return {
     c() {
@@ -78483,8 +79635,8 @@ function create_if_block_2(ctx) {
       div0.textContent = "Available Models";
       t1 = space();
       if_block.c();
-      attr(div0, "class", "px-4 py-1.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest bg-gray-50/50 dark:bg-gray-850/50 mb-1");
-      attr(div1, "class", "absolute top-full left-1/2 -translate-x-1/2 mt-1 bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl shadow-2xl py-2 z-50 min-w-[200px] max-h-[400px] overflow-y-auto animate-in fade-in slide-in-from-top-2 duration-200");
+      attr(div0, "class", "px-4 py-2 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-1");
+      attr(div1, "class", "absolute top-full left-0 mt-2 glass-effect-strong rounded-2xl p-1.5 z-50 min-w-[240px] max-h-[400px] overflow-y-auto animate-in fade-in zoom-in-95 duration-200");
     },
     m(target, anchor) {
       insert(target, div1, anchor);
@@ -78493,7 +79645,7 @@ function create_if_block_2(ctx) {
       if_block.m(div1, null);
     },
     p(ctx2, dirty) {
-      if (current_block_type === (current_block_type = select_block_type_1(ctx2)) && if_block) {
+      if (current_block_type === (current_block_type = select_block_type_2(ctx2)) && if_block) {
         if_block.p(ctx2, dirty);
       } else {
         if_block.d(1);
@@ -78569,13 +79721,13 @@ function create_else_block_1(ctx) {
     }
   };
 }
-function create_if_block_3(ctx) {
+function create_if_block_2(ctx) {
   let div;
   return {
     c() {
       div = element("div");
       div.textContent = "No models found. Check API key.";
-      attr(div, "class", "px-4 py-2 text-sm text-gray-500 italic");
+      attr(div, "class", "px-4 py-4 text-sm text-gray-500 italic text-center");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -78588,12 +79740,12 @@ function create_if_block_3(ctx) {
     }
   };
 }
-function create_if_block_4(ctx) {
+function create_if_block_3(ctx) {
   let div;
   return {
     c() {
       div = element("div");
-      attr(div, "class", "size-1.5 rounded-full bg-current");
+      attr(div, "class", "size-2 rounded-full bg-blue-500");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -78610,7 +79762,7 @@ function create_each_block(ctx) {
   let span;
   let t0_value = (
     /*model*/
-    ctx[25] + ""
+    ctx[24] + ""
   );
   let t0;
   let t1;
@@ -78621,14 +79773,14 @@ function create_each_block(ctx) {
   let if_block = (
     /*plugin*/
     ctx[0].data["chat-settings"].model === /*model*/
-    ctx[25] && create_if_block_4()
+    ctx[24] && create_if_block_3()
   );
   function click_handler_3() {
     return (
       /*click_handler_3*/
       ctx[20](
         /*model*/
-        ctx[25]
+        ctx[24]
       )
     );
   }
@@ -78641,9 +79793,9 @@ function create_each_block(ctx) {
       if (if_block) if_block.c();
       t2 = space();
       attr(span, "class", "truncate");
-      attr(button, "class", button_class_value = "w-full px-4 py-2.5 text-left text-sm transition-colors flex items-center justify-between gap-4 cursor-pointer " + /*plugin*/
+      attr(button, "class", button_class_value = "w-full px-4 py-2.5 rounded-xl text-left text-sm transition-all flex items-center justify-between gap-4 cursor-pointer " + /*plugin*/
       (ctx[0].data["chat-settings"].model === /*model*/
-      ctx[25] ? "bg-black text-white dark:bg-white dark:text-black" : "hover:bg-gray-100 dark:hover:bg-gray-700"));
+      ctx[24] ? "bg-blue-500/10 text-blue-600 dark:text-blue-300 font-medium" : "hover:bg-gray-100 dark:hover:bg-gray-800"));
     },
     m(target, anchor) {
       insert(target, button, anchor);
@@ -78661,15 +79813,15 @@ function create_each_block(ctx) {
       ctx = new_ctx;
       if (dirty & /*availableModels*/
       16 && t0_value !== (t0_value = /*model*/
-      ctx[25] + "")) set_data(t0, t0_value);
+      ctx[24] + "")) set_data(t0, t0_value);
       if (
         /*plugin*/
         ctx[0].data["chat-settings"].model === /*model*/
-        ctx[25]
+        ctx[24]
       ) {
         if (if_block) ;
         else {
-          if_block = create_if_block_4();
+          if_block = create_if_block_3();
           if_block.c();
           if_block.m(button, t2);
         }
@@ -78678,9 +79830,9 @@ function create_each_block(ctx) {
         if_block = null;
       }
       if (dirty & /*plugin, availableModels*/
-      17 && button_class_value !== (button_class_value = "w-full px-4 py-2.5 text-left text-sm transition-colors flex items-center justify-between gap-4 cursor-pointer " + /*plugin*/
+      17 && button_class_value !== (button_class_value = "w-full px-4 py-2.5 rounded-xl text-left text-sm transition-all flex items-center justify-between gap-4 cursor-pointer " + /*plugin*/
       (ctx[0].data["chat-settings"].model === /*model*/
-      ctx[25] ? "bg-black text-white dark:bg-white dark:text-black" : "hover:bg-gray-100 dark:hover:bg-gray-700"))) {
+      ctx[24] ? "bg-blue-500/10 text-blue-600 dark:text-blue-300 font-medium" : "hover:bg-gray-100 dark:hover:bg-gray-800"))) {
         attr(button, "class", button_class_value);
       }
     },
@@ -78689,58 +79841,6 @@ function create_each_block(ctx) {
         detach(button);
       }
       if (if_block) if_block.d();
-      mounted = false;
-      dispose();
-    }
-  };
-}
-function create_if_block_1(ctx) {
-  let button;
-  let square;
-  let t;
-  let current;
-  let mounted;
-  let dispose;
-  square = new Square({
-    props: { size: 12, fill: "currentColor" }
-  });
-  return {
-    c() {
-      button = element("button");
-      create_component(square.$$.fragment);
-      t = text$3("\r\n                        Stop Response");
-      attr(button, "class", "mb-3 flex items-center gap-2 px-4 py-2 rounded-full border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-850 text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-800 transition-all shadow-sm cursor-pointer animate-in fade-in slide-in-from-bottom-2");
-    },
-    m(target, anchor) {
-      insert(target, button, anchor);
-      mount_component(square, button, null);
-      append(button, t);
-      current = true;
-      if (!mounted) {
-        dispose = listen(
-          button,
-          "click",
-          /*stopResponse*/
-          ctx[9]
-        );
-        mounted = true;
-      }
-    },
-    p: noop,
-    i(local) {
-      if (current) return;
-      transition_in(square.$$.fragment, local);
-      current = true;
-    },
-    o(local) {
-      transition_out(square.$$.fragment, local);
-      current = false;
-    },
-    d(detaching) {
-      if (detaching) {
-        detach(button);
-      }
-      destroy_component(square);
       mounted = false;
       dispose();
     }
@@ -78768,7 +79868,7 @@ function create_fragment$1(ctx) {
     c() {
       div = element("div");
       if_block.c();
-      attr(div, "class", "flex h-full w-full bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100 overflow-hidden font-sans relative");
+      attr(div, "class", "flex h-full w-full gemini-bg text-gray-800 dark:text-gray-100 overflow-hidden font-sans relative");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -78884,61 +79984,6 @@ function instance$1($$self, $$props, $$invalidate) {
     addMessageToCurrent({ role: "assistant", content: "" });
     await performSend(content, references, images);
   }
-  async function syncToSiYuan() {
-    if (!currentConv || currentConv.messages.length < 2) return;
-    try {
-      const notebooks = await getNotebooks();
-      if (notebooks.length === 0) return;
-      const notebookId = currentConv.siyuanNotebookId || notebooks[0].id;
-      const safeTitle = currentConv.title.replace(/[\\/:*?"<>|]/g, "_").slice(0, 50);
-      const docPath = currentConv.siyuanPath || `/AI Chats/${safeTitle}-${currentConv.id.slice(0, 8)}`;
-      let markdown = `# ${currentConv.title}
-
-`;
-      markdown += `Last updated: ${/* @__PURE__ */ (/* @__PURE__ */ new Date()).toLocaleString()}
-
----
-
-`;
-      currentConv.messages.forEach((m) => {
-        if (m.content) {
-          markdown += `### ${m.role === "user" ? "You" : "Assistant"}
-
-${m.content}
-
-`;
-          if (m.images && m.images.length > 0) {
-            markdown += `*(Attached ${m.images.length} images)*
-
-`;
-          }
-          if (m.references && m.references.length > 0) {
-            markdown += `**References:** ${m.references.map((r) => `[[${r.title}]]`).join(", ")}
-
-`;
-          }
-          markdown += `---
-
-`;
-        }
-      });
-      const result = await createDoc(notebookId, docPath, markdown);
-      if (result && !currentConv.siyuanPath) {
-        conversations.update((convs) => convs.map((c) => {
-          if (c.id === currentConv.id) {
-            return {
-              ...c,
-              siyuanPath: docPath,
-              siyuanNotebookId: notebookId
-            };
-          }
-          return c;
-        }));
-      }
-    } catch (e) {
-      console.error("Failed to auto-sync to SiYuan:", e);
-    }
-  }
   async function performSend(content, references, images) {
     var _a;
     $$invalidate(2, isLoading = true);
@@ -78966,7 +80011,7 @@ ${md}
       const messages = [
         {
           role: "system",
-          content: "You are a helpful assistant. You will be provided with context from the user's notes. Use this context to answer their questions accurately. Be concise but thorough."
+          content: "You are a helpful assistant. You will be provided with context from the user's notes. Use this context to answer their questions accurately. Be concise but thorough. Use LaTeX for ALL mathematical equations and scientific notation, using $...$ for inline and $$...$$ for block equations. For example, use $\\nabla \\cdot E = \\frac{\\rho}{\\epsilon_0}$ instead of Unicode symbols."
         },
         ...(currentConv == null ? void 0 : currentConv.messages.slice(0, -1).map((m) => ({
           role: m.role,
@@ -78983,7 +80028,6 @@ ${md}
       for await (const chunk of stream) {
         appendChunkToCurrent(chunk);
       }
-      await syncToSiYuan();
     } catch (error2) {
       if (error2.name === "AbortError") {
         appendChunkToCurrent(`
@@ -79009,7 +80053,7 @@ ${md}
     $$invalidate(5, currentView = "settings");
     $$invalidate(1, showSidebar = false);
   };
-  const click_handler_1 = () => $$invalidate(1, showSidebar = true);
+  const click_handler_1 = () => $$invalidate(1, showSidebar = !showSidebar);
   const click_handler_2 = () => {
     $$invalidate(3, showModelPicker = !showModelPicker);
     if (showModelPicker) loadModels();
@@ -79075,8 +80119,8 @@ function create_if_block(ctx) {
       span = element("span");
       span.textContent = "Copy";
       attr(span, "class", "font-medium");
-      attr(button, "class", "w-full px-4 py-2 text-left text-sm flex items-center gap-3 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors cursor-pointer text-gray-700 dark:text-gray-200");
-      attr(div, "class", "fixed z-[999] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-2xl py-1.5 min-w-[140px] overflow-hidden animate-in fade-in zoom-in duration-100");
+      attr(button, "class", "w-full px-4 py-2 rounded-xl text-left text-sm flex items-center gap-3 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors cursor-pointer text-gray-700 dark:text-gray-200");
+      attr(div, "class", "fixed z-[999] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-2xl shadow-xl p-1.5 min-w-[140px] animate-in fade-in zoom-in duration-100");
       set_style(
         div,
         "left",

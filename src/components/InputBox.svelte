@@ -1,9 +1,11 @@
 <script lang="ts">
     import { createEventDispatcher, onMount } from 'svelte';
-    import { Send, FileText, X, Search, Plus, Image as ImageIcon } from 'lucide-svelte';
+    import { Send, Square, FileText, X, Search, Plus, Image as ImageIcon } from 'lucide-svelte';
     import { searchBlocks } from '../api/siyuan';
 
     export let i18n: any;
+    export let isLoading: boolean = false;
+    export let onStop: () => void = () => {};
 
     const dispatch = createEventDispatcher();
     let value = '';
@@ -134,8 +136,8 @@
 
     function autoGrow() {
         if (!inputElement) return;
-        inputElement.style.height = '60px'; // Base height
-        const newHeight = Math.max(60, Math.min(inputElement.scrollHeight, 240));
+        inputElement.style.height = '72px'; // Base height
+        const newHeight = Math.max(72, Math.min(inputElement.scrollHeight, 320));
         inputElement.style.height = newHeight + 'px';
     }
 
@@ -197,9 +199,17 @@
     }
 
     function handlePlusClick() {
-        value += '@';
-        inputElement.focus();
-        handleInput({ target: inputElement } as unknown as Event);
+        const opened = getOpenedNotes();
+        openedNotes = opened;
+        currentSearchId++;
+        const searchId = currentSearchId;
+        searchBlocks("").then(searched => {
+            if (searchId !== currentSearchId) return;
+            const openedIds = new Set(openedNotes.map(n => n.id));
+            suggestions = searched.filter(s => !openedIds.has(s.id));
+            showSuggestions = (openedNotes.length + suggestions.length) > 0;
+            selectedIndex = 0;
+        });
     }
 
     onMount(() => {
@@ -207,33 +217,33 @@
     });
 </script>
 
-<div class="px-8 mx-auto inset-x-0 w-full max-w-3xl font-primary mb-2">
-    <div class="w-full flex flex-col gap-1.5 relative">
+<div class="px-2 mx-auto inset-x-0 w-full max-w-4xl font-primary mb-2">
+    <div class="w-full flex flex-col gap-2 relative">
         {#if showSuggestions}
-            <div class="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 rounded-2xl shadow-xl z-10 overflow-hidden flex flex-col max-h-[400px]">
-                <div class="px-4 py-2 border-b border-gray-50 dark:border-gray-800 flex items-center gap-2 text-xs font-semibold text-gray-500 uppercase tracking-wider bg-gray-50/50 dark:bg-gray-850/50">
-                    <Search size={12} />
+            <div class="absolute bottom-full left-0 right-0 mb-4 glass-effect-strong rounded-2xl z-50 overflow-hidden flex flex-col max-h-[400px] animate-in fade-in slide-in-from-bottom-4 duration-300">
+                <div class="px-6 py-3 border-b border-gray-100 dark:border-gray-800 flex items-center gap-2 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest">
+                    <Search size={12} class="text-blue-500" />
                     <span>Quick Reference</span>
                 </div>
-                <div class="overflow-y-auto flex flex-col py-1">
+                <div class="overflow-y-auto flex flex-col py-2 custom-scrollbar">
                     {#if openedNotes.length > 0}
-                        <div class="px-4 py-1.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest bg-gray-50/30 dark:bg-gray-850/30">Opened Notes</div>
+                        <div class="px-6 py-2 text-[10px] font-bold text-blue-500/70 uppercase tracking-widest">Opened Notes</div>
                         {#each openedNotes as sug, i}
-                            <button class="w-full px-4 py-2 flex flex-col text-left transition-colors {i === selectedIndex ? 'bg-gray-100 dark:bg-gray-800' : 'hover:bg-gray-50 dark:hover:bg-gray-850'}" on:click={() => selectSuggestion(sug)}>
-                                <div class="flex items-center gap-2">
-                                    <FileText size={14} class="text-blue-500 shrink-0" />
-                                    <span class="text-sm text-gray-800 dark:text-gray-200 truncate font-medium">{sug.title}</span>
+                            <button class="w-full px-6 py-3 flex flex-col text-left transition-all {i === selectedIndex ? 'bg-blue-500/10 rounded-xl' : 'hover:bg-gray-100 dark:hover:bg-gray-800'}" on:click={() => selectSuggestion(sug)}>
+                                <div class="flex items-center gap-3">
+                                    <FileText size={16} class="{i === selectedIndex ? 'text-blue-500' : 'text-blue-500/70'} shrink-0" />
+                                    <span class="text-sm truncate {i === selectedIndex ? 'text-blue-600 font-medium' : ''}">{sug.title}</span>
                                 </div>
                             </button>
                         {/each}
                     {/if}
                     {#if suggestions.length > 0}
-                        <div class="px-4 py-1.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest bg-gray-50/30 dark:bg-gray-850/30 {openedNotes.length > 0 ? 'mt-2 border-t border-gray-50 dark:border-gray-800' : ''}">Search Results</div>
+                        <div class="px-6 py-2 text-[10px] font-bold text-purple-500/70 uppercase tracking-widest {openedNotes.length > 0 ? 'mt-4 border-t border-gray-100 dark:border-gray-800 pt-4' : ''}">Search Results</div>
                         {#each suggestions as sug, i}
-                            <button class="w-full px-4 py-2 flex flex-col text-left transition-colors {i + openedNotes.length === selectedIndex ? 'bg-gray-100 dark:bg-gray-800' : 'hover:bg-gray-50 dark:hover:bg-gray-800'}" on:click={() => selectSuggestion(sug)}>
-                                <div class="flex items-center gap-2">
-                                    <FileText size={14} class="text-gray-400 shrink-0" />
-                                    <span class="text-sm text-gray-800 dark:text-gray-200 truncate font-medium">{@html sug.content}</span>
+                            <button class="w-full px-6 py-3 flex flex-col text-left transition-all {i + openedNotes.length === selectedIndex ? 'bg-purple-500/10 rounded-xl' : 'hover:bg-gray-100 dark:hover:bg-gray-800'}" on:click={() => selectSuggestion(sug)}>
+                                <div class="flex items-center gap-3">
+                                    <FileText size={16} class="{i + openedNotes.length === selectedIndex ? 'text-purple-500' : 'text-purple-500/70'} shrink-0" />
+                                    <span class="text-sm truncate {i + openedNotes.length === selectedIndex ? 'text-purple-600 font-medium' : ''}">{@html sug.content}</span>
                                 </div>
                             </button>
                         {/each}
@@ -242,68 +252,75 @@
             </div>
         {/if}
 
-        <div id="message-input-container" class="flex flex-col relative w-full shadow-sm rounded-xl border border-gray-200/50 dark:border-gray-800/50 hover:border-gray-300 focus-within:border-gray-300 hover:dark:border-gray-700 focus-within:dark:border-gray-700 transition bg-white dark:bg-gray-850 dark:text-gray-100"
+        <div id="message-input-container" class="overflow-hidden flex flex-col transition-all duration-500 group rounded-3xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 shadow-xl shadow-gray-300/50 dark:shadow-black/30"
             on:drop={handleDrop}
             on:dragover|preventDefault={() => {}}
         >
             {#if selectedReferences.length > 0 || selectedImages.length > 0}
-                <div class="mx-3 mt-3 pb-1.5 flex items-center flex-wrap gap-2">
+                <div class="mx-4 mt-4 pb-2 flex items-center flex-wrap gap-3">
                     {#each selectedReferences as ref}
-                        <div class="relative group">
-                            <div class="flex items-center justify-center p-3 bg-gray-100 dark:bg-gray-800 rounded-xl max-w-[200px] border border-gray-200 dark:border-gray-700">
-                                <div class="flex items-center gap-2 overflow-hidden">
-                                    <FileText size={14} class="text-gray-500 shrink-0" />
-                                    <span class="text-xs font-medium truncate text-gray-700 dark:text-gray-300">{ref.title}</span>
-                                </div>
+                        <div class="relative group animate-in zoom-in duration-300">
+                            <div class="flex items-center gap-2 px-4 py-2 bg-blue-500/10 border border-blue-500/20 rounded-xl max-w-[220px]">
+                                <FileText size={14} class="text-blue-500 shrink-0" />
+                                <span class="text-xs font-bold truncate text-blue-700 dark:text-blue-300">{ref.title}</span>
                             </div>
-                            <div class="absolute -top-2 -right-2">
-                                <button class="bg-white text-black border border-white rounded-full transition hover:scale-110 shadow-sm cursor-pointer" on:click={() => removeReference(ref.id)}>
-                                    <div class="p-1"><X size={12} strokeWidth={2.5} /></div>
-                                </button>
-                            </div>
+                            <button class="absolute -top-2 -right-2 bg-white dark:bg-gray-800 text-red-500 border border-red-500/20 rounded-full p-1 shadow-lg hover:scale-125 transition-all cursor-pointer" on:click={() => removeReference(ref.id)}>
+                                <X size={10} strokeWidth={4} />
+                            </button>
                         </div>
                     {/each}
                     {#each selectedImages as img, i}
-                        <div class="relative group">
-                            <div class="size-16 rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700">
+                        <div class="relative group animate-in zoom-in duration-300">
+                            <div class="size-20 rounded-xl overflow-hidden border-2 border-purple-500/20 shadow-lg">
                                 <img src={img} alt="Preview" class="w-full h-full object-cover" />
                             </div>
-                            <div class="absolute -top-2 -right-2">
-                                <button class="bg-white text-black border border-white rounded-full transition hover:scale-110 shadow-sm cursor-pointer" on:click={() => removeImage(i)}>
-                                    <div class="p-1"><X size={12} strokeWidth={2.5} /></div>
-                                </button>
-                            </div>
+                            <button class="absolute -top-2 -right-2 bg-white dark:bg-gray-800 text-red-500 border border-red-500/20 rounded-full p-1 shadow-lg hover:scale-125 transition-all cursor-pointer" on:click={() => removeImage(i)}>
+                                <X size={10} strokeWidth={4} />
+                            </button>
                         </div>
                     {/each}
                 </div>
+            {:else}
             {/if}
 
-            <div class="relative flex flex-col min-h-[60px]">
+            <div class="relative flex flex-col min-h-[72px]">
                 <button 
-                    class="absolute top-3 left-3 shrink-0 p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 transition-all cursor-pointer flex items-center justify-center border border-gray-200/50 dark:border-gray-700/50 z-10" 
+                    class="absolute left-4 shrink-0 w-10 h-10 rounded-full text-blue-500 hover:bg-blue-500/10 transition-all cursor-pointer flex items-center justify-center border border-blue-500/10 z-10 hover:scale-110 active:scale-90" 
+                    style="top: 50%; margin-top: -20px;"
                     title="Attach note (Type @)" 
                     on:click={handlePlusClick}
                 >
-                    <Plus size={14} strokeWidth={3} />
+                    <Plus size={18} strokeWidth={3} />
                 </button>
 
                 <textarea
                     bind:this={inputElement}
                     bind:value
-                    placeholder="@ to reference notes"
+                    placeholder="Type @ to reference your notes..."
                     on:input={handleInput}
                     on:keydown={handleKeydown}
                     on:paste={handlePaste}
-                    class="scrollbar-hidden bg-transparent dark:text-gray-100 outline-none w-full resize-none h-[60px] max-h-60 overflow-auto text-[14px] leading-relaxed placeholder-gray-400/80 pl-12 pr-12 py-4"
+                    class="scrollbar-hidden bg-transparent text-gray-950 dark:text-gray-50 outline-none w-full resize-none h-[72px] max-h-80 overflow-auto text-base leading-relaxed placeholder-gray-400 dark:placeholder-gray-500 pl-16 pr-16 py-6 font-normal"
                 ></textarea>
 
-                <button 
-                    class="absolute top-3 right-3 shrink-0 flex items-center justify-center w-8 h-8 rounded-lg bg-black text-white dark:bg-white dark:text-black transition-all hover:scale-105 active:scale-95 disabled:opacity-30 disabled:hover:scale-100 disabled:cursor-not-allowed cursor-pointer z-10"
-                    on:click={send} 
-                    disabled={!value.trim() && selectedReferences.length === 0 && selectedImages.length === 0}
-                >
-                    <Send size={16} strokeWidth={2.5} />
-                </button>
+                {#if isLoading}
+                    <button 
+                        class="absolute right-4 shrink-0 flex items-center justify-center w-10 h-10 rounded-full bg-red-500 text-white transition-all hover:scale-110 active:scale-90 shadow-lg cursor-pointer z-10 animate-in fade-in zoom-in duration-200"
+                        style="top: 50%; margin-top: -20px;"
+                        on:click={onStop}
+                    >
+                        <Square size={16} fill="currentColor" />
+                    </button>
+                {:else}
+                    <button 
+                        class="absolute right-4 shrink-0 flex items-center justify-center w-10 h-10 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 text-white transition-all hover:scale-110 active:scale-90 shadow-lg disabled:opacity-20 disabled:grayscale disabled:hover:scale-100 disabled:cursor-not-allowed cursor-pointer z-10"
+                        style="top: 50%; margin-top: -20px;"
+                        on:click={send} 
+                        disabled={!value.trim() && selectedReferences.length === 0 && selectedImages.length === 0}
+                    >
+                        <Send size={18} strokeWidth={2.5} class={value.trim() ? 'animate-pulse' : ''} />
+                    </button>
+                {/if}
             </div>
         </div>
     </div>

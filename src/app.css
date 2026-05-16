@@ -17,12 +17,12 @@
 }
 
 body {
-  color: var(--color-gray-800);
+  color: var(--color-gray-950) !important;
 }
 
 @media (prefers-color-scheme: dark) {
   body {
-    color: var(--color-gray-100);
+    color: var(--color-gray-50) !important;
   }
 }
 
@@ -34,4 +34,117 @@ body {
 button, .cursor-pointer, .cursor-pointer * {
   user-select: none !important;
   -webkit-user-select: none !important;
+}
+
+/* Markdown Prose Contrast - ensures text is visible on bright backgrounds */
+.markdown-prose {
+  color: var(--color-gray-950) !important;
+}
+
+.markdown-prose p,
+.markdown-prose li,
+.markdown-prose h1,
+.markdown-prose h2,
+.markdown-prose h3,
+.markdown-prose h4,
+.markdown-prose h5,
+.markdown-prose h6,
+.markdown-prose blockquote,
+.markdown-prose th,
+.markdown-prose td,
+.markdown-prose strong,
+.markdown-prose em,
+.markdown-prose dt,
+.markdown-prose dd,
+.markdown-prose figcaption,
+.markdown-prose a {
+  color: var(--color-gray-950) !important;
+}
+
+.markdown-prose blockquote {
+  border-left-color: var(--color-gray-300) !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  .markdown-prose {
+    color: var(--color-gray-50) !important;
+  }
+
+  .markdown-prose p,
+  .markdown-prose li,
+  .markdown-prose h1,
+  .markdown-prose h2,
+  .markdown-prose h3,
+  .markdown-prose h4,
+  .markdown-prose h5,
+  .markdown-prose h6,
+  .markdown-prose blockquote,
+  .markdown-prose th,
+  .markdown-prose td,
+  .markdown-prose strong,
+  .markdown-prose em,
+  .markdown-prose dt,
+  .markdown-prose dd,
+  .markdown-prose figcaption,
+  .markdown-prose a {
+    color: var(--color-gray-50) !important;
+  }
+
+  .markdown-prose blockquote {
+    border-left-color: var(--color-gray-600) !important;
+  }
+}
+
+/* Glassy Effects */
+.glass-effect {
+  @apply backdrop-blur-xl bg-white/95 dark:bg-gray-900/80 border border-gray-300 dark:border-white/10 shadow-xl;
+}
+
+.glass-effect-strong {
+  @apply backdrop-blur-2xl bg-white/98 dark:bg-gray-900/90 border border-gray-300 dark:border-white/15 shadow-2xl;
+}
+
+.glass-input {
+  @apply backdrop-blur-lg bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-500/20 transition-all duration-300 shadow-md;
+  background-color: white !important;
+  border-radius: 10px !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  .glass-input {
+    background-color: var(--color-gray-850) !important;
+  }
+}
+
+/* Gemini-inspired Gradients */
+.gemini-bg {
+  background: radial-gradient(circle at top left, rgba(66, 133, 244, 0.05), transparent 40%),
+              radial-gradient(circle at bottom right, rgba(161, 73, 224, 0.05), transparent 40%),
+              linear-gradient(to bottom, #ffffff, #f8faff);
+}
+
+@media (prefers-color-scheme: dark) {
+  .gemini-bg {
+    background: radial-gradient(circle at top left, rgba(66, 133, 244, 0.1), transparent 40%),
+                radial-gradient(circle at bottom right, rgba(161, 73, 224, 0.1), transparent 40%),
+                linear-gradient(to bottom, #0f1115, #161a22);
+  }
+}
+
+.gemini-gradient-text {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-purple-600 dark:from-blue-400 dark:to-purple-400;
+}
+
+/* Smooth Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300/50 dark:bg-gray-700/50 rounded-full hover:bg-gray-400/50 dark:hover:bg-gray-600/50 transition-colors;
 }

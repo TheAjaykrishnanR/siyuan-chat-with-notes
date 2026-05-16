@@ -13,6 +13,7 @@
         provider: 'openai',
         keys: { openai: '', anthropic: '', gemini: '', deepseek: '' },
         models: { openai: '', anthropic: '', gemini: '', deepseek: '' },
+        debugMode: false,
         ...plugin.data['chat-settings'] 
     };
 
@@ -91,107 +92,120 @@
     ];
 </script>
 
-<div class="flex flex-col h-full bg-white dark:bg-gray-900 overflow-hidden font-sans">
-    <header class="flex items-center justify-between px-4 py-3 border-b border-gray-100 dark:border-gray-800 shrink-0">
-        <div class="flex items-center gap-2">
-            <Settings class="text-gray-500" size={18} />
-            <h2 class="text-base font-semibold text-gray-800 dark:text-gray-100">AI Configuration</h2>
+<div class="flex flex-col h-full bg-transparent overflow-hidden font-sans">
+    <header class="flex items-center justify-between px-6 py-4 glass-effect shrink-0">
+        <div class="flex items-center gap-3">
+            <div class="p-2 bg-gradient-to-br from-blue-500 to-purple-500 rounded-full text-white shadow-lg">
+                <Settings size={20} />
+            </div>
+            <h2 class="text-lg font-bold gemini-gradient-text tracking-tight">AI Configuration</h2>
         </div>
         <button 
-            class="p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-500 transition-colors cursor-pointer"
+            class="w-10 h-10 flex items-center justify-center rounded-full hover:bg-red-500/10 text-gray-500 hover:text-red-500 transition-all cursor-pointer hover:scale-110 active:scale-90"
             on:click={() => dispatch('close')}
         >
-            <X size={18} />
+            <X size={20} strokeWidth={2.5} />
         </button>
     </header>
 
     <div class="flex-1 flex overflow-hidden">
         <!-- Vertical Tab Navigation -->
-        <nav class="w-40 border-r border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-850/50 flex flex-col py-2 px-2 gap-1 overflow-y-auto">
-            <div class="px-3 py-2 mb-1">
-                <span class="text-xs font-medium text-gray-400">Providers</span>
+        <nav class="w-48 glass-effect border-r border-white/5 flex flex-col py-4 px-3 gap-1 overflow-y-auto custom-scrollbar">
+            <div class="px-3 py-2 mb-2">
+                <span class="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">Providers</span>
             </div>
             {#each providers as p}
                 <button 
-                    class="w-full px-3 py-2.5 text-sm font-normal text-left rounded-xl transition-all cursor-pointer flex items-center justify-between group
+                    class="w-full px-4 py-3 text-sm font-semibold text-left rounded-2xl transition-all cursor-pointer flex items-center justify-between group
                     {activeTab === p.id 
-                        ? 'bg-white dark:bg-gray-800 text-black dark:text-white shadow-sm ring-1 ring-gray-200 dark:ring-gray-700' 
-                        : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800/50'}"
+                        ? 'bg-blue-600 text-white shadow-lg shadow-blue-500/20' 
+                        : 'text-gray-600 dark:text-gray-400 hover:bg-blue-500/10 hover:text-blue-500'}"
                     on:click={() => { activeTab = p.id; autoSave(); }}
                 >
                     <span>{p.name}</span>
                     {#if activeTab === p.id}
-                        <div class="size-1.5 rounded-full bg-blue-500"></div>
+                        <div class="size-2 rounded-full bg-white animate-pulse"></div>
                     {/if}
                 </button>
             {/each}
+
+            <div class="px-3 py-2 mt-auto mb-2 border-t border-white/5 pt-4">
+                <span class="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] block mb-3">Debug</span>
+                <label class="flex items-center justify-between cursor-pointer group">
+                    <span class="text-xs font-semibold text-gray-600 dark:text-gray-400 group-hover:text-blue-500 transition-colors">Debug Mode</span>
+                    <div class="relative inline-flex items-center">
+                        <input type="checkbox" bind:checked={settings.debugMode} class="sr-only peer" on:change={autoSave}>
+                        <div class="w-8 h-4 bg-gray-200 peer-focus:outline-none dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blue-600 rounded-full"></div>
+                    </div>
+                </label>
+            </div>
         </nav>
 
         <!-- Content Area -->
-        <main class="flex-1 overflow-y-auto p-6 bg-white dark:bg-gray-900">
-            <div class="max-w-xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-300" key={activeTab}>
+        <main class="flex-1 overflow-y-auto p-8 custom-scrollbar">
+            <div class="max-w-2xl mx-auto space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-500" key={activeTab}>
                 <!-- API Key Section -->
-                <div class="space-y-3">
+                <div class="space-y-4">
                     <div class="flex items-center justify-between">
-                        <label class="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] flex items-center gap-2">
-                            <Key size={12} />
+                        <label class="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] flex items-center gap-2">
+                            <Key size={14} class="text-blue-500" />
                             {activeTab} API Key
                         </label>
                     </div>
-                    <div class="flex gap-2">
+                    <div class="flex gap-3">
                         <input 
                             type="password" 
                             bind:value={settings.keys[activeTab]}
                             on:input={autoSave}
                             placeholder={`Paste your ${activeTab} key here...`}
-                            class="flex-1 px-4 py-3 bg-gray-50 dark:bg-gray-850 border border-gray-200 dark:border-gray-800 rounded-xl text-sm outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
+                            class="flex-1 px-5 py-3.5 bg-white/5 border border-white/10 rounded-2xl text-sm outline-none focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500/50 transition-all font-mono"
                         />
                         <button 
-                            class="px-4 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300 transition-all flex items-center justify-center cursor-pointer border border-transparent"
+                            class="px-5 rounded-2xl glass-effect hover:bg-blue-500/10 text-blue-500 transition-all flex items-center justify-center cursor-pointer hover:scale-105 active:scale-95 shadow-md"
                             on:click={() => refreshModels(activeTab)}
                             title="Fetch Models"
                             disabled={isFetching[activeTab]}
                         >
-                            <RefreshCcw size={18} class={isFetching[activeTab] ? 'animate-spin' : ''} />
+                            <RefreshCcw size={20} class={isFetching[activeTab] ? 'animate-spin' : ''} />
                         </button>
                     </div>
                 </div>
 
                 <!-- Model Selection Section -->
-                <div class="space-y-4">
-                    <label class="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] flex items-center gap-2">
-                        <Cpu size={12} />
+                <div class="space-y-6">
+                    <label class="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] flex items-center gap-2">
+                        <Cpu size={14} class="text-purple-500" />
                         Default Model for {activeTab}
                     </label>
                     
                     {#if availableModels[activeTab].length === 0 && !isFetching[activeTab]}
-                        <div class="p-10 border-2 border-dashed border-gray-100 dark:border-gray-800 rounded-3xl flex flex-col items-center justify-center text-center gap-4 group hover:border-gray-200 dark:hover:border-gray-700 transition-colors">
-                            <div class="p-4 bg-gray-50 dark:bg-gray-850 rounded-full text-gray-300 group-hover:scale-110 transition-transform">
-                                <RefreshCcw size={28} />
+                        <div class="p-12 glass-effect border-dashed border-2 border-white/10 rounded-[32px] flex flex-col items-center justify-center text-center gap-6 group hover:border-blue-500/30 transition-all">
+                            <div class="p-6 bg-gradient-to-br from-blue-500/10 to-purple-500/10 rounded-full text-blue-500/30 group-hover:scale-110 group-hover:text-blue-500 transition-all duration-500">
+                                <RefreshCcw size={40} />
                             </div>
-                            <p class="text-xs text-gray-400 leading-relaxed">Click the refresh button next to your API key<br/>to load the available models from {activeTab}.</p>
+                            <p class="text-sm text-gray-400 dark:text-gray-500 font-medium leading-relaxed">Click the refresh button next to your API key<br/><span class="text-blue-500/50">to discover available models for {activeTab}.</span></p>
                         </div>
                     {:else if isFetching[activeTab]}
-                        <div class="space-y-2.5">
+                        <div class="space-y-3">
                             {#each Array(4) as _}
-                                <div class="h-12 w-full bg-gray-50 dark:bg-gray-850 animate-pulse rounded-xl"></div>
+                                <div class="h-14 w-full bg-white/5 animate-pulse rounded-2xl"></div>
                             {/each}
                         </div>
                     {:else}
-                        <div class="grid gap-2">
+                        <div class="grid gap-3">
                             {#each availableModels[activeTab] as model}
                                 <button 
-                                    class="w-full px-5 py-3.5 rounded-xl border text-left text-sm transition-all flex items-center justify-between group cursor-pointer
+                                    class="w-full px-6 py-4 rounded-2xl border transition-all flex items-center justify-between group cursor-pointer
                                     {settings.models[activeTab] === model 
-                                        ? 'bg-blue-50 dark:bg-blue-900/20 border-blue-500 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/20' 
-                                        : 'bg-transparent border-gray-100 dark:border-gray-800 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-600'}"
+                                        ? 'bg-gradient-to-r from-blue-600/10 to-purple-600/10 border-blue-500 shadow-lg shadow-blue-500/5' 
+                                        : 'bg-white/5 border-white/5 hover:border-white/10 hover:bg-white/10'}"
                                     on:click={() => { settings.models[activeTab] = model; autoSave(); }}
                                 >
-                                    <span class="font-medium truncate">{model}</span>
+                                    <span class="text-sm font-bold {settings.models[activeTab] === model ? 'text-blue-500' : 'text-gray-600 dark:text-gray-300'} truncate">{model}</span>
                                     {#if settings.models[activeTab] === model}
-                                        <div class="size-2 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]"></div>
+                                        <div class="size-2.5 rounded-full bg-blue-500 shadow-[0_0_12px_rgba(59,130,246,0.8)] animate-pulse"></div>
                                     {:else}
-                                        <ChevronRight size={14} class="text-gray-300 opacity-0 group-hover:opacity-100 transition-all translate-x-[-4px] group-hover:translate-x-0" />
+                                        <ChevronRight size={16} class="text-gray-400 opacity-0 group-hover:opacity-100 transition-all -translate-x-2 group-hover:translate-x-0" />
                                     {/if}
                                 </button>
                             {/each}
@@ -202,7 +216,7 @@
         </main>
     </div>
 
-    <footer class="p-3 border-t border-gray-100 dark:border-gray-800 bg-gray-50/10 dark:bg-gray-850/10 shrink-0 text-center">
-        <span class="text-[10px] text-gray-400 font-medium uppercase tracking-widest">Settings are saved automatically</span>
+    <footer class="p-4 glass-effect border-t border-white/5 text-center">
+        <span class="text-[10px] text-gray-400 dark:text-gray-500 font-bold uppercase tracking-[0.3em]">Cloud-Sync: Changes are saved instantly</span>
     </footer>
 </div>

@@ -45,13 +45,11 @@
         });
         
         // Handle case where selection is INSIDE a katex element
-        // (the fragment clone might not contain the wrapper itself if only part of the math was selected)
-        // We'll check the common ancestor to see if we're inside a wrapper
         let current: Node | null = range.commonAncestorContainer;
         while (current && current !== document.body) {
             if (current instanceof HTMLElement && current.classList.contains('katex-wrapper')) {
                 const latex = current.getAttribute('data-latex');
-                if (latex) return latex; // Return full latex if we're inside one
+                if (latex) return latex;
             }
             current = current.parentNode;
         }
@@ -101,12 +99,12 @@
 
     {#if showContextMenu}
         <div 
-            class="fixed z-[999] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-2xl py-1.5 min-w-[140px] overflow-hidden animate-in fade-in zoom-in duration-100"
+            class="fixed z-[999] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-2xl shadow-xl p-1.5 min-w-[140px] animate-in fade-in zoom-in duration-100"
             style="left: {contextMenuPos.x}px; top: {contextMenuPos.y}px;"
             on:click|stopPropagation
         >
             <button 
-                class="w-full px-4 py-2 text-left text-sm flex items-center gap-3 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors cursor-pointer text-gray-700 dark:text-gray-200"
+                class="w-full px-4 py-2 rounded-xl text-left text-sm flex items-center gap-3 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors cursor-pointer text-gray-700 dark:text-gray-200"
                 on:click={copyText}
             >
                 <Copy size={15} />

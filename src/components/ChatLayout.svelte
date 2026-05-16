@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount } from 'svelte';
+    import { fly, fade } from 'svelte/transition';
     import Sidebar from './Sidebar.svelte';
     import MessageList from './MessageList.svelte';
     import InputBox from './InputBox.svelte';
@@ -7,7 +8,7 @@
     import { conversations, currentConversationId, addMessageToCurrent, appendChunkToCurrent, replaceLastMessageWithAssistant, createNewConversation } from '../store/chat';
     import { streamMessage, fetchModels } from '../api/ai';
     import { getBlockMarkdown, getNotebooks, createDoc } from '../api/siyuan';
-    import { PanelLeftClose, PanelLeftOpen, ChevronDown, Square } from 'lucide-svelte';
+    import { PanelLeftOpen, ChevronDown, Menu, X } from 'lucide-svelte';
 
     export let plugin: any;
     
@@ -79,47 +80,6 @@
         await performSend(content, references, images);
     }
 
-    async function syncToSiYuan() {
-        if (!currentConv || currentConv.messages.length < 2) return;
-
-        try {
-            const notebooks = await getNotebooks();
-            if (notebooks.length === 0) return;
-
-            const notebookId = currentConv.siyuanNotebookId || notebooks[0].id;
-            const safeTitle = currentConv.title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 50);
-            const docPath = currentConv.siyuanPath || `/AI Chats/${safeTitle}-${currentConv.id.slice(0, 8)}`;
-
-            let markdown = `# ${currentConv.title}\n\n`;
-            markdown += `Last updated: ${new Date().toLocaleString()}\n\n---\n\n`;
-            
-            currentConv.messages.forEach(m => {
-                if (m.content) {
-                    markdown += `### ${m.role === 'user' ? 'You' : 'Assistant'}\n\n${m.content}\n\n`;
-                    if (m.images && m.images.length > 0) {
-                        markdown += `*(Attached ${m.images.length} images)*\n\n`;
-                    }
-                    if (m.references && m.references.length > 0) {
-                        markdown += `**References:** ${m.references.map(r => `[[${r.title}]]`).join(', ')}\n\n`;
-                    }
-                    markdown += `---\n\n`;
-                }
-            });
-
-            const result = await createDoc(notebookId, docPath, markdown);
-            if (result && !currentConv.siyuanPath) {
-                conversations.update(convs => convs.map(c => {
-                    if (c.id === currentConv!.id) {
-                        return { ...c, siyuanPath: docPath, siyuanNotebookId: notebookId };
-                    }
-                    return c;
-                }));
-            }
-        } catch (e) {
-            console.error("Failed to auto-sync to SiYuan:", e);
-        }
-    }
-
     async function performSend(content: string, references: any[], images: string[]) {
         isLoading = true;
         abortController = new AbortController();
@@ -143,7 +103,7 @@
             }
 
             const messages = [
-                { role: 'system', content: 'You are a helpful assistant. You will be provided with context from the user\'s notes. Use this context to answer their questions accurately. Be concise but thorough.' },
+                { role: 'system', content: "You are a helpful assistant. You will be provided with context from the user's notes. Use this context to answer their questions accurately. Be concise but thorough. Use LaTeX for ALL mathematical equations and scientific notation, using $...$ for inline and $$...$$ for block equations. For example, use $\\nabla \\cdot E = \\frac{\\rho}{\\epsilon_0}$ instead of Unicode symbols." },
                 ...(currentConv?.messages.slice(0, -1).map(m => ({ 
                     role: m.role, 
                     content: m.content,
@@ -161,8 +121,6 @@
                 appendChunkToCurrent(chunk);
             }
 
-            await syncToSiYuan();
-
         } catch (error: any) {
             if (error.name === 'AbortError') {
                 appendChunkToCurrent(`\n\n*Response stopped by user.*`);
@@ -176,90 +134,93 @@
     }
 </script>
 
-<div class="flex h-full w-full bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-100 overflow-hidden font-sans relative" on:click={() => showModelPicker = false}>
+<div class="flex h-full w-full gemini-bg text-gray-800 dark:text-gray-100 overflow-hidden font-sans relative" on:click={() => showModelPicker = false}>
     
     {#if currentView === 'settings'}
-        <SettingsView {plugin} on:close={() => { currentView = 'chat'; loadModels(); }} />
+        <div class="absolute inset-0 z-50 glass-effect-strong animate-in fade-in duration-300">
+            <SettingsView {plugin} on:close={() => { currentView = 'chat'; loadModels(); }} />
+        </div>
     {:else}
         {#if showSidebar}
             <!-- Backdrop -->
             <div 
-                class="absolute inset-0 bg-black/20 dark:bg-black/40 z-10"
+                class="absolute inset-0 bg-black/10 dark:bg-black/30 backdrop-blur-sm z-30"
                 on:click={() => showSidebar = false}
+                transition:fade={{ duration: 200 }}
             ></div>
             
             <!-- Sidebar Container -->
-            <div class="absolute top-0 bottom-0 left-0 z-20 shadow-2xl">
+            <div class="absolute top-0 bottom-0 left-0 z-40 shadow-2xl"
+                transition:fly={{ x: -320, duration: 250 }}
+            >
                 <Sidebar {plugin} i18n={plugin.i18n} on:close={() => showSidebar = false} on:openSettings={() => { currentView = 'settings'; showSidebar = false; }} />
             </div>
         {/if}
 
         <div class="flex-1 flex flex-col h-full relative min-w-0">
             <!-- Header with model selector and sidebar toggle inline -->
-            <header class="flex items-center justify-between px-2 py-2 bg-white dark:bg-gray-900 z-1 sticky top-0 border-b border-transparent">
-                <div class="flex items-center w-12">
-                    {#if !showSidebar}
-                        <button 
-                            class="p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-850 text-gray-500 dark:text-gray-400 transition-colors cursor-pointer"
-                            on:click|stopPropagation={() => showSidebar = true}
-                            title="Open Sidebar"
-                        >
-                            <PanelLeftOpen size={20} strokeWidth={1.5} />
-                        </button>
-                    {/if}
-                </div>
-                
-                <div class="relative">
+            <header class="flex items-center gap-3 px-3 py-2 glass-effect sticky top-0 z-30 transition-all duration-300">
+                <div class="flex items-center gap-2">
                     <button 
-                        class="font-medium text-lg flex items-center gap-2 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-850 px-3 py-1.5 rounded-xl transition-colors border-none bg-transparent"
-                        on:click|stopPropagation={() => { showModelPicker = !showModelPicker; if(showModelPicker) loadModels(); }}
+                        class="w-9 h-9 flex items-center justify-center rounded-full hover:bg-gray-500/10 dark:hover:bg-white/10 text-gray-600 dark:text-gray-300 transition-all cursor-pointer hover:scale-110 active:scale-95 group relative z-50"
+                        on:click|stopPropagation={() => showSidebar = !showSidebar}
+                        title={showSidebar ? "Close Sidebar" : "Open Sidebar"}
                     >
-                        {plugin.data['chat-settings']?.model || 'AI Chat'}
-                        <ChevronDown size={14} class="text-gray-400 transition-transform {showModelPicker ? 'rotate-180' : ''}" />
+                        {#if showSidebar}
+                            <X size={18} strokeWidth={1.5} class="group-hover:text-red-500 transition-colors" />
+                        {:else}
+                            <Menu size={18} strokeWidth={1.5} class="group-hover:text-blue-500 transition-colors" />
+                        {/if}
                     </button>
 
-                    {#if showModelPicker}
-                        <div class="absolute top-full left-1/2 -translate-x-1/2 mt-1 bg-white dark:bg-gray-800 border border-gray-100 dark:border-gray-700 rounded-2xl shadow-2xl py-2 z-50 min-w-[200px] max-h-[400px] overflow-y-auto animate-in fade-in slide-in-from-top-2 duration-200">
-                            <div class="px-4 py-1.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest bg-gray-50/50 dark:bg-gray-850/50 mb-1">
-                                Available Models
+                    <div class="relative">
+                        <button 
+                            class="font-semibold text-sm flex items-center gap-1.5 cursor-pointer hover:bg-white/40 dark:hover:bg-gray-800/40 px-3 py-1.5 rounded-full transition-all border-none bg-transparent gemini-gradient-text"
+                            on:click|stopPropagation={() => { showModelPicker = !showModelPicker; if(showModelPicker) loadModels(); }}
+                        >
+                            {plugin.data['chat-settings']?.model || 'AI Chat'}
+                            <ChevronDown size={12} class="text-blue-500/70 transition-transform {showModelPicker ? 'rotate-180' : ''}" />
+                        </button>
+
+                        {#if showModelPicker}
+                            <div class="absolute top-full left-0 mt-2 glass-effect-strong rounded-2xl p-1.5 z-50 min-w-[240px] max-h-[400px] overflow-y-auto animate-in fade-in zoom-in-95 duration-200">
+                                <div class="px-4 py-2 text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-widest mb-1">
+                                    Available Models
+                                </div>
+                                {#if availableModels.length === 0}
+                                    <div class="px-4 py-4 text-sm text-gray-500 italic text-center">No models found. Check API key.</div>
+                                {:else}
+                                    {#each availableModels as model}
+                                        <button 
+                                            class="w-full px-4 py-2.5 rounded-xl text-left text-sm transition-all flex items-center justify-between gap-4 cursor-pointer {plugin.data['chat-settings'].model === model ? 'bg-blue-500/10 text-blue-600 dark:text-blue-300 font-medium' : 'hover:bg-gray-100 dark:hover:bg-gray-800'}"
+                                            on:click={() => selectModel(model)}
+                                        >
+                                            <span class="truncate">{model}</span>
+                                            {#if plugin.data['chat-settings'].model === model}
+                                                <div class="size-2 rounded-full bg-blue-500"></div>
+                                            {/if}
+                                        </button>
+                                    {/each}
+                                {/if}
                             </div>
-                            {#if availableModels.length === 0}
-                                <div class="px-4 py-2 text-sm text-gray-500 italic">No models found. Check API key.</div>
-                            {:else}
-                                {#each availableModels as model}
-                                    <button 
-                                        class="w-full px-4 py-2.5 text-left text-sm transition-colors flex items-center justify-between gap-4 cursor-pointer {plugin.data['chat-settings'].model === model ? 'bg-black text-white dark:bg-white dark:text-black' : 'hover:bg-gray-100 dark:hover:bg-gray-700'}"
-                                        on:click={() => selectModel(model)}
-                                    >
-                                        <span class="truncate">{model}</span>
-                                        {#if plugin.data['chat-settings'].model === model}
-                                            <div class="size-1.5 rounded-full bg-current"></div>
-                                        {/if}
-                                    </button>
-                                {/each}
-                            {/if}
-                        </div>
-                    {/if}
+                        {/if}
+                    </div>
                 </div>
-                
-                <div class="w-12"></div> <!-- Spacer for centering -->
             </header>
 
             <div class="flex-1 overflow-hidden relative flex flex-col items-center w-full">
-                <MessageList messages={currentConv?.messages || []} {isLoading} on:regenerate={handleRegenerate} />
+                <MessageList 
+                    messages={currentConv?.messages || []} 
+                    {isLoading} 
+                    on:regenerate={handleRegenerate} 
+                    debugMode={plugin.data['chat-settings']?.debugMode}
+                />
             </div>
 
-            <div class="w-full flex flex-col items-center bg-white dark:bg-gray-900 pt-2 pb-6 z-1">
-                {#if isLoading}
-                    <button 
-                        class="mb-3 flex items-center gap-2 px-4 py-2 rounded-full border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-850 text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-800 transition-all shadow-sm cursor-pointer animate-in fade-in slide-in-from-bottom-2"
-                        on:click={stopResponse}
-                    >
-                        <Square size={12} fill="currentColor" />
-                        Stop Response
-                    </button>
-                {/if}
-                <InputBox i18n={plugin.i18n} on:send={handleSend} />
+            <div class="w-full flex flex-col items-center bg-transparent pt-2 pb-2 z-10 relative">
+                <div class="w-full max-w-4xl px-4">
+                    <InputBox i18n={plugin.i18n} on:send={handleSend} {isLoading} onStop={stopResponse} />
+                </div>
             </div>
         </div>
     {/if}
